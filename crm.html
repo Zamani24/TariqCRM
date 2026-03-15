@@ -1,0 +1,2255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tariq CRM</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0b0c10;color:#e8e8f0;font-family:system-ui,sans-serif;height:100vh;display:flex;overflow:hidden}
+::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#2a2a3a}
+button{cursor:pointer;font-family:inherit}
+input,select,textarea{font-family:inherit;outline:none}
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.nav-btn:hover{background:#161720!important}
+.row-btn:hover{background:#111118!important}
+.card:hover{transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,0,0,0.3)}
+.anim{animation:fadeUp 0.35s ease both}
+</style>
+</head>
+<body>
+<div id="sidebar"></div>
+<div id="main" style="flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0"></div>
+<div id="drawer"></div>
+<div id="modal"></div>
+<script>
+var STAGES = ["Prospecting","Contacted","Replied","Meeting Set","Proposal Sent","Closed Won","Closed Lost","Nurture"];
+var COLORS = {
+  "Prospecting":  {b:"#4a9eff",bg:"rgba(74,158,255,0.09)",d:"#4a9eff"},
+  "Contacted":    {b:"#f5a623",bg:"rgba(245,166,35,0.09)",d:"#f5a623"},
+  "Replied":      {b:"#a78bfa",bg:"rgba(167,139,250,0.09)",d:"#a78bfa"},
+  "Meeting Set":  {b:"#34d399",bg:"rgba(52,211,153,0.09)",d:"#34d399"},
+  "Proposal Sent":{b:"#38bdf8",bg:"rgba(56,189,248,0.09)",d:"#38bdf8"},
+  "Closed Won":   {b:"#10b981",bg:"rgba(16,185,129,0.13)",d:"#10b981"},
+  "Closed Lost":  {b:"#f87171",bg:"rgba(248,113,113,0.09)",d:"#f87171"},
+  "Nurture":      {b:"#94a3b8",bg:"rgba(148,163,184,0.09)",d:"#94a3b8"}
+};
+var SCORE_LABEL = ["Cold","Warm","Hot","Urgent"];
+var SCORE_COLOR = ["#94a3b8","#f5a623","#f87171","#a78bfa"];
+var DB_KEY = "tariq_crm_v6";
+
+function dbLoad() {
+  try { var r = localStorage.getItem(DB_KEY); return r ? JSON.parse(r) : null; } catch(e) { return null; }
+}
+function dbSave(data) {
+  try { localStorage.setItem(DB_KEY, JSON.stringify(data)); } catch(e) {}
+}
+
+
+
+// Track when contact entered current stage
+function recordStageEntry(oldContact, patch) {
+  if (patch.stage && patch.stage !== oldContact.stage) {
+    patch.stageEnteredDate = today();
+  }
+  return patch;
+}
+
+// Days stuck in current stage
+function daysInStage(c) {
+  if (!c.stageEnteredDate) return null;
+  return Math.floor((Date.now() - new Date(c.stageEnteredDate).getTime()) / 86400000);
+}
+
+// Pipeline coverage: pipeline value vs monthly quota target
+function pipelineCoverage() {
+  var pipe = G.contacts.filter(function(c) {
+    return !["Closed Won","Closed Lost"].includes(c.stage);
+  }).reduce(function(s,c) { return s + (parseFloat(c.value)||0); }, 0);
+  var target = G.quota.monthlyTarget || 10000;
+  return {pipe: pipe, target: target, ratio: target > 0 ? pipe/target : 0};
+}
+
+// Win/loss reasons aggregated
+function getWinLossStats() {
+  var reasons = {won:{}, lost:{}};
+  G.contacts.forEach(function(c) {
+    if (c.stage === "Closed Won" && c.closeReason) {
+      reasons.won[c.closeReason] = (reasons.won[c.closeReason]||0)+1;
+    }
+    if (c.stage === "Closed Lost" && c.closeReason) {
+      reasons.lost[c.closeReason] = (reasons.lost[c.closeReason]||0)+1;
+    }
+  });
+  return reasons;
+}
+
+// BANT score: 0-4 based on what's confirmed
+function bantScore(c) {
+  var score = 0;
+  if (c.bantBudget === "confirmed") score++;
+  if (c.bantAuthority === "decision_maker") score++;
+  if (c.bantNeed === "strong") score++;
+  if (c.bantTimeline === "this_quarter") score++;
+  return score;
+}
+
+// Deal health score: composite of BANT + engagement + velocity
+function dealHealth(c) {
+  if (["Closed Won","Closed Lost"].includes(c.stage)) return null;
+  var score = 0; var max = 10;
+  // BANT completeness (4 pts)
+  score += bantScore(c);
+  // Has inbound reply (1 pt)
+  if ((c.emails||[]).some(function(e){ return e.direction==="in"; })) score++;
+  // Has a call logged (1 pt)
+  if ((c.calls||[]).length > 0) score++;
+  // Not stale (2 pts)
+  var d = daysAgo(c.lastContact);
+  if (d !== null && d < 7) score += 2;
+  else if (d !== null && d < 14) score++;
+  // Stage velocity ok (2 pts)
+  var dis = daysInStage(c);
+  if (dis !== null && dis < 14) score += 2;
+  else if (dis !== null && dis < 21) score++;
+  return Math.round((score/max)*100);
+}
+
+
+// ICP Fit Score (0-100): how well contact matches ideal customer profile
+function icpScore(c) {
+  var score = 0;
+  var icp = G.icpConfig || {industries:[], titles:[], minDeal:5000, maxDeal:50000};
+  // Industry match
+  if (icp.industries && icp.industries.length > 0) {
+    if (c.industry && icp.industries.some(function(i){ return c.industry.toLowerCase().includes(i.toLowerCase()); })) score += 30;
+  } else { score += 15; }
+  // Title match (decision-maker signals)
+  var dmTitles = ['vp','director','head','chief','cco','cro','cso','cmo','ceo','founder','owner','president'];
+  if (c.title) {
+    var titleLower = c.title.toLowerCase();
+    if (dmTitles.some(function(t){ return titleLower.includes(t); })) score += 25;
+    else if (titleLower.includes('manager') || titleLower.includes('lead')) score += 10;
+  }
+  // Custom title match from ICP config
+  if (icp.titles && icp.titles.length > 0 && c.title) {
+    if (icp.titles.some(function(t){ return c.title.toLowerCase().includes(t.toLowerCase()); })) score += 20;
+  }
+  // Deal value in range
+  var val = parseFloat(c.value) || 0;
+  if (val >= (icp.minDeal||0) && val <= (icp.maxDeal||999999)) score += 25;
+  else if (val > 0) score += 10;
+  return Math.min(100, score);
+}
+
+// Get ICP color
+function icpColor(score) {
+  if (score >= 70) return "#34d399";
+  if (score >= 40) return "#f5a623";
+  return "#f87171";
+}
+
+// Forecast categories
+var FORECAST_CATS = ["Commit", "Upside", "Pipeline", "Omit"];
+var FORECAST_COLORS = {Commit:"#34d399", Upside:"#4a9eff", Pipeline:"#f5a623", Omit:"#94a3b8"};
+
+// Get forecast summary
+function getForecastSummary() {
+  var result = {Commit:0, Upside:0, Pipeline:0, Omit:0};
+  G.contacts.filter(function(c){ return !["Closed Won","Closed Lost"].includes(c.stage); }).forEach(function(c) {
+    var cat = c.forecastCat || "Pipeline";
+    result[cat] = (result[cat]||0) + (parseFloat(c.value)||0);
+  });
+  return result;
+}
+
+// Templates library helpers
+function getTemplates() {
+  try { var r = localStorage.getItem("tariq_templates_v1"); return r ? JSON.parse(r) : []; } catch(e) { return []; }
+}
+function saveTemplates(t) {
+  try { localStorage.setItem("tariq_templates_v1", JSON.stringify(t)); } catch(e) {}
+}
+
+// Auto-score: calculate based on activity signals
+function autoScore(c) {
+  if (["Closed Won","Closed Lost"].includes(c.stage)) return c.score || 0;
+  var score = 0;
+  var d = daysAgo(c.lastContact);
+  var inboundEmails = (c.emails||[]).filter(function(e){ return e.direction==="in"; }).length;
+  var meetings = (c.meetings||[]).length;
+  var calls = (c.calls||[]).filter(function(l){ return l.sentiment==="positive"; }).length;
+  var stageIdx = STAGES.indexOf(c.stage);
+  // Stage-based baseline
+  if (stageIdx >= 3) score += 2; // Meeting Set or beyond
+  else if (stageIdx >= 2) score += 1; // Replied
+  // Engagement signals
+  if (inboundEmails > 0) score += 1;
+  if (meetings > 0) score += 1;
+  if (calls > 0) score += 1;
+  // Recency penalty
+  if (d !== null && d > 14) score = Math.max(0, score - 1);
+  if (d === null) score = 0;
+  return Math.min(3, score);
+}
+
+// Duplicate detection: returns array of {contact, matchType} for suspected dupes
+function findDupes(contacts, newEmail, newCompany, newName) {
+  var dupes = [];
+  contacts.forEach(function(c) {
+    if (newEmail && c.email && c.email.toLowerCase() === newEmail.toLowerCase()) {
+      dupes.push({c:c, reason:"Same email address"});
+    } else if (newName && c.name && c.name.toLowerCase() === newName.toLowerCase() && newCompany && c.company && c.company.toLowerCase() === newCompany.toLowerCase()) {
+      dupes.push({c:c, reason:"Same name and company"});
+    }
+  });
+  return dupes;
+}
+
+function today() { return new Date().toISOString().split("T")[0]; }
+function daysAgo(d) { if (!d) return null; return Math.floor((Date.now() - new Date(d).getTime()) / 86400000); }
+function fmtVal(v) { return v ? "$" + parseInt(v).toLocaleString() : "-"; }
+
+var SEED = [
+  {id:"c1",name:"Sarah Chen",title:"VP Sales",company:"Mosaic HQ",email:"sarah@mosaichq.com",phone:"647-555-0192",stage:"Contacted",value:"12000",notes:"Responded to cold email. Q1 budget.",source:"Cold Email",industry:"SaaS",score:2,nextStep:"Book discovery call",calls:[],tasks:[{id:"t1",text:"Follow up re Q1 budget",done:false,due:"2026-03-18",priority:"high"}],emails:[{id:"e1",subject:"Scaling outbound",preview:"Hi Sarah...",date:"2026-03-10",direction:"out"},{id:"e2",subject:"Re: Scaling outbound",preview:"Hey Tariq, open to a call",date:"2026-03-11",direction:"in"}],meetings:[],sequences:[],objections:[{id:"o1",text:"Already using HubSpot",resolved:false}],lastContact:"2026-03-11",stageEnteredDate:"2026-03-08",bantBudget:"likely",bantAuthority:"influencer",bantNeed:"strong",bantTimeline:"this_quarter"},
+  {id:"c2",name:"James Okafor",title:"Head of RevOps",company:"Volta Systems",email:"james@voltasys.io",phone:"416-555-0381",stage:"Meeting Set",value:"18000",notes:"Wants Clay workflow demo.",source:"LinkedIn",industry:"SaaS",score:3,nextStep:"Run Clay demo",calls:[{id:"l1",date:"2026-03-08",duration:"22 min",notes:"HubSpot plus Apollo, no enrichment. Low reply rates.",sentiment:"positive",nextAction:"Send demo"}],tasks:[{id:"t2",text:"Confirm Zoom Mar 17",done:false,due:"2026-03-15",priority:"high"}],emails:[{id:"e3",subject:"New to the role",preview:"Hi James...",date:"2026-03-05",direction:"out"}],meetings:[{id:"m1",title:"Clay Workflow Demo",date:"2026-03-17",time:"10:00 AM",platform:"Zoom",agenda:"Stack review, Clay demo, ROI, Next steps"}],sequences:[],objections:[{id:"o2",text:"6-month contract with current vendor",resolved:false}],lastContact:"2026-03-08",stageEnteredDate:"2026-03-05",bantBudget:"confirmed",bantAuthority:"decision_maker",bantNeed:"strong",bantTimeline:"this_quarter"},
+  {id:"c3",name:"Priya Nair",title:"Director RevOps",company:"Archway AI",email:"pnair@archway.ai",phone:"",stage:"Replied",value:"9500",notes:"Wants case study.",source:"Cold Email",industry:"AI",score:2,nextStep:"Send case study",calls:[],tasks:[{id:"t4",text:"Send case study and ROI",done:false,due:"2026-03-14",priority:"high"}],emails:[{id:"e4",subject:"Outbound broken?",preview:"Hi Priya...",date:"2026-03-07",direction:"out"},{id:"e5",subject:"Re: Outbound broken?",preview:"Interesting timing...",date:"2026-03-09",direction:"in"}],meetings:[],sequences:[],objections:[],lastContact:"2026-03-09",stageEnteredDate:"2026-03-07",bantBudget:"likely",bantAuthority:"influencer",bantNeed:"moderate",bantTimeline:"next_quarter"},
+  {id:"c4",name:"Tom Reilly",title:"VP Sales",company:"Stackline",email:"treilly@stackline.com",phone:"905-555-0274",stage:"Prospecting",value:"15000",notes:"",source:"Apollo",industry:"SaaS",score:0,nextStep:"Send first-touch",calls:[],tasks:[],emails:[],meetings:[],sequences:[],objections:[],lastContact:null},
+  {id:"c5",name:"Dana Wu",title:"Head of RevOps",company:"Folio Finance",email:"dana@foliofinance.com",phone:"",stage:"Closed Won",value:"22000",notes:"Signed 3-month engagement.",source:"Referral",industry:"Fintech",score:3,nextStep:"Week 2 check-in",calls:[{id:"l2",date:"2026-03-01",duration:"45 min",notes:"Kickoff complete.",sentiment:"positive",nextAction:"Week 2 sync"}],tasks:[{id:"t5",text:"Week 2 check-in",done:false,due:"2026-03-17",priority:"medium"}],emails:[],meetings:[{id:"m2",title:"Week 1 Sync",date:"2026-03-08",time:"2:00 PM",platform:"Google Meet",agenda:""}],sequences:[],objections:[],lastContact:"2026-03-08"}
+];
+
+var G = {
+  contacts: [],
+  view: "signal",
+  selId: null,
+  tab: "overview",
+  editing: false,
+  draft: null,
+  modal: null,
+  pendingStageChange: null,
+  drag: null,
+  dragOver: null,
+  quota: {emails:50,calls:20,meetings:10,monthlyTarget:15000},
+  icpConfig: {industries:["SaaS","Software","Tech","AI","Fintech"], titles:["RevOps","Sales","GTM"], minDeal:5000, maxDeal:50000},
+  forecastView: false
+};
+
+function init() {
+  var saved = dbLoad();
+  if (saved && saved.contacts && saved.contacts.length > 0) {
+    G.contacts = saved.contacts;
+    if (saved.quota) G.quota = saved.quota;
+  } else {
+    G.contacts = JSON.parse(JSON.stringify(SEED));
+  }
+  // Auto-score all contacts on load
+  G.contacts = G.contacts.map(function(c) { return Object.assign({}, c, {score: autoScore(c)}); });
+  render();
+}
+
+function persist() {
+  // Refresh auto-scores before saving
+  G.contacts = G.contacts.map(function(c) { return Object.assign({}, c, {score: autoScore(c)}); });
+  dbSave({contacts:G.contacts, quota:G.quota});
+}
+
+function updateContact(id, patch) {
+  G.contacts = G.contacts.map(function(c) {
+    if (c.id === id) {
+      patch = recordStageEntry(c, patch);
+      return Object.assign({}, c, patch);
+    }
+    return c;
+  });
+  if (G.selId === id && G.draft) {
+    G.draft = Object.assign({}, G.draft, patch);
+  }
+  persist();
+  render();
+}
+
+function deleteContact(id) {
+  G.contacts = G.contacts.filter(function(c) { return c.id !== id; });
+  G.selId = null;
+  persist();
+  render();
+}
+
+function getSelected() {
+  return G.selId ? G.contacts.find(function(c) { return c.id === G.selId; }) : null;
+}
+
+function getPending() {
+  return G.contacts.flatMap(function(c) {
+    return (c.tasks || []).map(function(t) {
+      return Object.assign({}, t, {cName: c.name, cId: c.id});
+    });
+  }).filter(function(t) { return !t.done; }).sort(function(a,b) {
+    return new Date(a.due) - new Date(b.due);
+  });
+}
+
+function getStats() {
+  var won = G.contacts.filter(function(c) { return c.stage === "Closed Won"; });
+  var lost = G.contacts.filter(function(c) { return c.stage === "Closed Lost"; });
+  var pipe = G.contacts.filter(function(c) { return !["Closed Won","Closed Lost"].includes(c.stage); });
+  var wkAgo = new Date(); wkAgo.setDate(wkAgo.getDate() - 7);
+  var ws = wkAgo.toISOString().split("T")[0];
+  return {
+    pipe: pipe.length,
+    won: won.length,
+    val: won.reduce(function(s,c) { return s + (parseFloat(c.value)||0); }, 0),
+    pipeVal: pipe.reduce(function(s,c) { return s + (parseFloat(c.value)||0); }, 0),
+    tasks: getPending().length,
+    hot: G.contacts.filter(function(c) { return c.score >= 2 && !["Closed Won","Closed Lost"].includes(c.stage); }).length,
+    winRate: (won.length + lost.length) > 0 ? Math.round(won.length / (won.length + lost.length) * 100) : 0,
+    avgDeal: won.length > 0 ? Math.round(won.reduce(function(s,c) { return s+(parseFloat(c.value)||0); }, 0) / won.length) : 0,
+    emails: G.contacts.flatMap(function(c) { return c.emails||[]; }).filter(function(e) { return e.direction==="out" && e.date>=ws; }).length,
+    calls: G.contacts.flatMap(function(c) { return c.calls||[]; }).filter(function(l) { return l.date>=ws; }).length,
+    meetings: G.contacts.flatMap(function(c) { return c.meetings||[]; }).filter(function(m) { return m.date>=ws; }).length
+  };
+}
+
+async function callAI(sys, usr, tok) {
+  tok = tok || 700;
+  var resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({model:"claude-sonnet-4-20250514", max_tokens:tok, system:sys, messages:[{role:"user",content:usr}]})
+  });
+  var data = await resp.json();
+  var content = data.content && data.content.find(function(b) { return b.type === "text"; });
+  return (content ? content.text : "").replace(/```json|```/g, "").trim();
+}
+
+// DOM helpers
+function el(tag, props) {
+  var e = document.createElement(tag);
+  if (!props) return e;
+  Object.keys(props).forEach(function(k) {
+    if (k === "style") { Object.assign(e.style, props[k]); }
+    else if (k === "cls") { e.className = props[k]; }
+    else if (k === "on") { Object.keys(props[k]).forEach(function(ev) { e.addEventListener(ev, props[k][ev]); }); }
+    else if (k === "text") { e.textContent = props[k]; }
+    else { e[k] = props[k]; }
+  });
+  return e;
+}
+
+function div(style) {
+  var e = document.createElement("div");
+  if (typeof style === "object") Object.assign(e.style, style);
+  for (var i = 1; i < arguments.length; i++) {
+    var c = arguments[i];
+    if (c == null) continue;
+    if (typeof c === "string" || typeof c === "number") e.appendChild(document.createTextNode(String(c)));
+    else if (c instanceof Node) e.appendChild(c);
+  }
+  return e;
+}
+
+function mkBtn(text, onClick, style) {
+  var b = el("button", {text: text, on: {click: onClick}});
+  if (style) Object.assign(b.style, style);
+  return b;
+}
+
+function mkInput(val, onChange, style, type) {
+  var i = el("input", {type: type || "text"});
+  Object.assign(i.style, {background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"6px",padding:"7px 9px",color:"#e8e8f0",fontSize:"12px",outline:"none",width:"100%"});
+  if (style) Object.assign(i.style, style);
+  i.value = val || "";
+  i.addEventListener("input", function(e) { onChange(e.target.value); });
+  return i;
+}
+
+function mkSelect(val, options, onChange, style) {
+  var s = el("select");
+  Object.assign(s.style, {background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"6px",padding:"7px 9px",color:"#e8e8f0",fontSize:"12px",outline:"none",width:"100%"});
+  if (style) Object.assign(s.style, style);
+  options.forEach(function(opt) {
+    var pair = Array.isArray(opt) ? opt : [opt, opt];
+    var o = el("option", {text: String(pair[1]), value: String(pair[0])});
+    if (String(pair[0]) === String(val)) o.selected = true;
+    s.appendChild(o);
+  });
+  s.addEventListener("change", function(e) { onChange(e.target.value); });
+  return s;
+}
+
+function mkTextarea(val, onChange, style) {
+  var t = el("textarea");
+  Object.assign(t.style, {background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"6px",padding:"7px 9px",color:"#e8e8f0",fontSize:"12px",outline:"none",width:"100%",minHeight:"64px",resize:"vertical"});
+  if (style) Object.assign(t.style, style);
+  t.value = val || "";
+  t.addEventListener("input", function(e) { onChange(e.target.value); });
+  return t;
+}
+
+function mkLabel(text) {
+  var l = el("label");
+  Object.assign(l.style, {display:"flex",flexDirection:"column",gap:"3px",fontSize:"9px",color:"#888",fontWeight:"700",letterSpacing:"0.05em",textTransform:"uppercase"});
+  l.textContent = text;
+  for (var i = 1; i < arguments.length; i++) {
+    if (arguments[i] instanceof Node) l.appendChild(arguments[i]);
+  }
+  return l;
+}
+
+function accentBtn(text, onClick) {
+  return mkBtn(text, onClick, {padding:"9px",borderRadius:"8px",background:"linear-gradient(135deg,#4a9eff,#a78bfa)",border:"none",color:"#fff",fontSize:"12px",fontWeight:"700",width:"100%"});
+}
+
+function addRowBtn(text, onClick) {
+  return mkBtn("+ " + text, onClick, {display:"flex",alignItems:"center",gap:"4px",padding:"5px 10px",background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"6px",color:"#aaa",fontSize:"10px",fontWeight:"600",marginBottom:"9px"});
+}
+
+function infoRow(label, value) {
+  var r = div({display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid #0f0f16"});
+  r.appendChild(div({fontSize:"11px",color:"#666"}, label));
+  r.appendChild(div({fontSize:"11px",fontWeight:"500"}, String(value)));
+  return r;
+}
+
+function initials(name) {
+  return name.split(" ").map(function(w) { return w[0]; }).join("").slice(0,2).toUpperCase();
+}
+
+function avatar(name, sc, size) {
+  size = size || 26;
+  var a = div({width:size+"px",height:size+"px",borderRadius:Math.round(size*0.22)+"px",background:sc.bg,border:"1px solid "+sc.b,color:sc.d,display:"grid",placeItems:"center",fontSize:Math.round(size*0.38)+"px",fontWeight:"700",flexShrink:"0"}, initials(name));
+  return a;
+}
+
+function sectionTitle(text, color) {
+  return div({fontSize:"9px",fontWeight:"700",color:color||"#888",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:"7px"}, text);
+}
+
+function paceBar(label, val, target, color) {
+  var pct = Math.min(100, Math.round(val / target * 100));
+  var w = div({marginBottom:"5px"});
+  var top = div({display:"flex",justifyContent:"space-between",marginBottom:"2px"});
+  top.appendChild(div({fontSize:"9px",color:"#666"}, label));
+  top.appendChild(div({fontSize:"9px",color:val>=target?"#34d399":color,fontWeight:"700"}, val + "/" + target));
+  w.appendChild(top);
+  var track = div({height:"3px",background:"#1e1e2a",borderRadius:"2px"});
+  track.appendChild(div({height:"100%",width:pct+"%",background:val>=target?"#34d399":color,borderRadius:"2px"}));
+  w.appendChild(track);
+  return w;
+}
+
+// ================================================================
+// RENDER SIDEBAR
+// ================================================================
+function renderSidebar() {
+  var sb = document.getElementById("sidebar");
+  sb.innerHTML = "";
+  Object.assign(sb.style, {width:"210px",background:"#0e0f14",borderRight:"1px solid #1a1a24",display:"flex",flexDirection:"column",flexShrink:"0"});
+
+  var st = getStats(); var q = G.quota;
+
+  // Logo
+  var logo = div({display:"flex",alignItems:"center",gap:"9px",padding:"14px 13px",borderBottom:"1px solid #1a1a24"});
+  var mark = div({width:"29px",height:"29px",borderRadius:"8px",background:"linear-gradient(135deg,#4a9eff,#a78bfa)",display:"grid",placeItems:"center",fontWeight:"800",fontSize:"13px",color:"#fff",flexShrink:"0"}, "T");
+  var nameDiv = div({});
+  nameDiv.appendChild(div({fontSize:"13px",fontWeight:"700"}, "Tariq CRM"));
+  nameDiv.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.07em"}, "SDR - BDR - AE"));
+  logo.appendChild(mark); logo.appendChild(nameDiv); sb.appendChild(logo);
+
+  // Nav
+  var nav = div({display:"flex",flexDirection:"column",gap:"1px",padding:"9px 7px",flex:"1"});
+  var navItems = [["signal","Signal Feed"],["pipeline","Pipeline"],["forecast","Forecast"],["contacts","Contacts"],["tasks","Tasks"],["callqueue","Call Queue"],["cal","Calendar"],["stats","Performance"],["templates","Templates"]];
+  navItems.forEach(function(pair) {
+    var id = pair[0], label = pair[1];
+    var pending = getPending();
+    var b = mkBtn(label, function() { G.view = id; G.selId = null; render(); }, {
+      display:"flex",alignItems:"center",gap:"8px",padding:"8px 9px",borderRadius:"7px",
+      background:G.view===id?"#161720":"transparent",border:"none",
+      color:G.view===id?"#4a9eff":"#888",fontSize:"12px",fontWeight:"500",width:"100%",textAlign:"left"
+    });
+    b.className = "nav-btn";
+    if (id === "tasks" && pending.length > 0) {
+      b.appendChild(div({marginLeft:"auto",background:"#f5a62322",color:"#f5a623",fontSize:"9px",fontWeight:"700",padding:"1px 5px",borderRadius:"100px"}, pending.length));
+    }
+    nav.appendChild(b);
+  });
+  sb.appendChild(nav);
+
+  // Quota
+  var qDiv = div({padding:"9px 8px",borderTop:"1px solid #1a1a24"});
+  var qHead = div({display:"flex",justifyContent:"space-between",marginBottom:"6px"});
+  qHead.appendChild(div({fontSize:"9px",color:"#444",textTransform:"uppercase",letterSpacing:"0.09em"}, "Weekly Pace"));
+  qHead.appendChild(mkBtn("Edit", function() { G.modal="quota"; renderModal(); }, {fontSize:"9px",color:"#4a9eff",background:"none",border:"none"}));
+  qDiv.appendChild(qHead);
+  qDiv.appendChild(paceBar("Emails", st.emails, q.emails, "#4a9eff"));
+  qDiv.appendChild(paceBar("Calls", st.calls, q.calls, "#a78bfa"));
+  qDiv.appendChild(paceBar("Meetings", st.meetings, q.meetings, "#34d399"));
+  sb.appendChild(qDiv);
+
+  // Stats grid
+  var sg = div({display:"grid",gridTemplateColumns:"1fr 1fr",borderTop:"1px solid #1a1a24"});
+  [["Active",st.pipe,"#e8e8f0"],["Won",st.won,"#34d399"],["Hot",st.hot,"#f87171"],["Tasks",st.tasks,st.tasks>0?"#f5a623":"#666"]].forEach(function(a) {
+    var box = div({background:"#0d0d12",padding:"7px",textAlign:"center"});
+    box.appendChild(div({fontSize:"14px",fontWeight:"700",color:a[2]}, a[1]));
+    box.appendChild(div({fontSize:"9px",color:"#444",textTransform:"uppercase",letterSpacing:"0.06em"}, a[0]));
+    sg.appendChild(box);
+  });
+  sb.appendChild(sg);
+}
+
+// ================================================================
+// RENDER MAIN
+// ================================================================
+function renderMain() {
+  var mn = document.getElementById("main");
+  mn.innerHTML = "";
+  var st = getStats();
+  var titles = {signal:"Signal Feed",pipeline:"Pipeline",forecast:"Forecast",contacts:"Contacts",tasks:"Tasks",callqueue:"Call Queue",cal:"Calendar",stats:"Performance",templates:"Templates"};
+
+  var tb = div({display:"flex",alignItems:"center",justifyContent:"space-between",padding:"11px 20px 9px",borderBottom:"1px solid #1a1a24",flexShrink:"0",gap:"8px"});
+  var tl = div({});
+  tl.appendChild(div({fontSize:"15px",fontWeight:"700"}, titles[G.view] || ""));
+  tl.appendChild(div({fontSize:"10px",color:"#555",marginTop:"1px"}, G.contacts.length + " contacts - " + st.pipe + " active - $" + (st.val/1000).toFixed(0) + "k won"));
+  tb.appendChild(tl);
+  var tr = div({display:"flex",gap:"5px"});
+  tr.appendChild(mkBtn("ICP", function() { G.modal="icpConfig"; renderModal(); }, {padding:"5px 9px",borderRadius:"7px",background:"#13131a",border:"1px solid #1e1e2a",color:"#aaa",fontSize:"11px",fontWeight:"600"}));
+  tr.appendChild(mkBtn("Import", function() { G.modal="import"; renderModal(); }, {padding:"5px 10px",borderRadius:"7px",background:"#13131a",border:"1px solid #1e1e2a",color:"#aaa",fontSize:"11px",fontWeight:"600"}));
+  tr.appendChild(mkBtn("+ Add", function() { G.modal="addContact"; renderModal(); }, {padding:"5px 12px",borderRadius:"7px",background:"linear-gradient(135deg,#4a9eff,#a78bfa)",border:"none",color:"#fff",fontSize:"11px",fontWeight:"700"}));
+  tb.appendChild(tr); mn.appendChild(tb);
+
+  var content = div({flex:"1",overflowY:"auto",padding:"13px 20px 18px"});
+  content.className = "anim";
+  var viewFns = {signal:renderSignal,pipeline:renderKanban,forecast:renderForecast,contacts:renderContacts,tasks:renderTasks,callqueue:renderCallQueue,cal:renderCal,stats:renderStats,templates:renderTemplates};
+  if (viewFns[G.view]) content.appendChild(viewFns[G.view]());
+  mn.appendChild(content);
+}
+
+// ================================================================
+// SIGNAL FEED
+// ================================================================
+function renderSignal() {
+  var cx = G.contacts, td2 = today(), pend = getPending(), st = getStats(), q = G.quota;
+  var sigs = [];
+  pend.filter(function(t) { return t.due < td2; }).forEach(function(t) {
+    var c = cx.find(function(x) { return x.id === t.cId; });
+    if (c) sigs.push({p:1,col:"#f87171",c:c,txt:'Overdue: ' + t.text,sub:c.name + " - due " + t.due,tag:"OVERDUE"});
+  });
+  pend.filter(function(t) { return t.due === td2; }).forEach(function(t) {
+    var c = cx.find(function(x) { return x.id === t.cId; });
+    if (c) sigs.push({p:2,col:"#f5a623",c:c,txt:"Due today: " + t.text,sub:c.name,tag:"TODAY"});
+  });
+  cx.filter(function(c) { return !["Closed Won","Closed Lost"].includes(c.stage); }).forEach(function(c) {
+    var d = daysAgo(c.lastContact), thr = c.score >= 2 ? 5 : 10;
+    if (d === null || d >= thr) sigs.push({p:c.score>=2?2:3,col:SCORE_COLOR[c.score||0],c:c,txt:SCORE_LABEL[c.score||0] + " lead " + (d===null?"never contacted":d+"d silent"),sub:c.name + " - " + c.stage,tag:SCORE_LABEL[c.score||0].toUpperCase()});
+  });
+  cx.filter(function(c) { return c.stage === "Proposal Sent"; }).forEach(function(c) {
+    var d = daysAgo(c.lastContact);
+    if (d !== null && d >= 3) sigs.push({p:2,col:"#38bdf8",c:c,txt:"Proposal follow-up needed - " + d + "d",sub:c.name + " - " + fmtVal(c.value),tag:"FOLLOW UP"});
+  });
+
+  // Stalled deals: in same stage > 14 days
+  cx.filter(function(c) {
+    return !["Closed Won","Closed Lost","Prospecting"].includes(c.stage);
+  }).forEach(function(c) {
+    var dis = daysInStage(c);
+    if (dis !== null && dis >= 14) {
+      sigs.push({p:2,col:"#f5a623",c:c,txt:"Stalled " + dis + "d in " + c.stage,sub:c.name + " - " + fmtVal(c.value),tag:"STALLED"});
+    }
+  });
+  var soonDate = new Date(); soonDate.setDate(soonDate.getDate() + 3); var sd = soonDate.toISOString().split("T")[0];
+  cx.forEach(function(c) {
+    (c.meetings||[]).forEach(function(m) {
+      if (m.date >= td2 && m.date <= sd) sigs.push({p:1,col:"#34d399",c:c,txt:"Meeting: " + m.title,sub:m.date + " - " + (m.time||""),tag:"MEETING"});
+    });
+  });
+  sigs.sort(function(a,b) { return a.p - b.p; });
+
+  var w = div({maxWidth:"640px"});
+  var hdr = div({marginBottom:"14px"});
+  hdr.appendChild(div({fontSize:"10px",color:"#555",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"2px"}, new Date().toLocaleDateString("en-CA",{weekday:"long",month:"long",day:"numeric"})));
+  hdr.appendChild(div({fontSize:"19px",fontWeight:"700"}, "Good morning, Tariq"));
+  hdr.appendChild(div({fontSize:"12px",color:"#888",marginTop:"2px"}, sigs.filter(function(s) { return ["OVERDUE","TODAY"].includes(s.tag); }).length + " tasks need attention - " + st.hot + " hot leads"));
+  w.appendChild(hdr);
+
+  var kpi = div({display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"6px",marginBottom:"8px"});
+  var upcoming = cx.flatMap(function(c) { return c.meetings||[]; }).filter(function(m) { return m.date >= td2; }).length;
+  var needsAction = sigs.filter(function(s) { return ["OVERDUE","TODAY","FOLLOW UP","STALLED"].includes(s.tag); }).length;
+  var stalled = sigs.filter(function(s){ return s.tag === "STALLED"; }).length;
+  [[st.pipe,"Pipeline","#4a9eff"],[st.hot,"Hot/Urgent","#f87171"],[needsAction,"Needs Action","#f5a623"]].forEach(function(a) {
+    var box = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"9px",padding:"10px 11px"});
+    box.appendChild(div({fontSize:"18px",fontWeight:"700",color:a[2]}, a[0]));
+    box.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.06em",marginTop:"1px"}, a[1]));
+    kpi.appendChild(box);
+  });
+  w.appendChild(kpi);
+  // Pipeline coverage bar
+  var cov = pipelineCoverage();
+  var covPct = Math.min(100, Math.round(cov.ratio/3*100));
+  var covColor = cov.ratio >= 3 ? "#34d399" : cov.ratio >= 2 ? "#f5a623" : "#f87171";
+  var covBox = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"9px",padding:"10px 13px",marginBottom:"12px"});
+  var covHead = div({display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"});
+  var covTitle = div({display:"flex",alignItems:"center",gap:"8px"});
+  covTitle.appendChild(div({fontSize:"10px",fontWeight:"700",color:"#888",textTransform:"uppercase",letterSpacing:"0.07em"}, "Pipeline Coverage"));
+  covTitle.appendChild(mkBtn("Edit Target", function(){ G.modal="setTarget"; renderModal(); }, {fontSize:"8px",color:"#4a9eff",background:"none",border:"none",padding:"0"}));
+  covHead.appendChild(covTitle);
+  var covRatio = div({fontSize:"12px",fontWeight:"700",color:covColor}, cov.ratio.toFixed(1) + "x");
+  var covTarget = div({fontSize:"10px",color:"#555"}, " of 3x target");
+  var covRight = div({display:"flex",alignItems:"baseline",gap:"3px"});
+  covRight.appendChild(covRatio); covRight.appendChild(covTarget);
+  covHead.appendChild(covRight);
+  covBox.appendChild(covHead);
+  var covTrack = div({height:"6px",background:"#1e1e2a",borderRadius:"3px"});
+  var covFill = div({height:"100%",width:covPct+"%",background:covColor,borderRadius:"3px",transition:"width .4s"});
+  covTrack.appendChild(covFill); covBox.appendChild(covTrack);
+  var covSub = div({display:"flex",justifyContent:"space-between",marginTop:"5px"});
+  covSub.appendChild(div({fontSize:"9px",color:"#666"}, "Pipeline: $" + (cov.pipe/1000).toFixed(1) + "k"));
+  covSub.appendChild(div({fontSize:"9px",color:"#666"}, "Monthly target: $" + (cov.target/1000).toFixed(1) + "k"));
+  covBox.appendChild(covSub);
+  w.appendChild(covBox);
+
+  var pace = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"9px",padding:"11px 13px",marginBottom:"12px"});
+  pace.appendChild(sectionTitle("Weekly Pace"));
+  var pg = div({display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"10px"});
+  [["Emails",st.emails,q.emails,"#4a9eff"],["Calls",st.calls,q.calls,"#a78bfa"],["Meetings",st.meetings,q.meetings,"#34d399"]].forEach(function(a) {
+    var col = div({});
+    var top = div({display:"flex",justifyContent:"space-between",marginBottom:"3px"});
+    top.appendChild(div({fontSize:"10px",color:"#aaa"}, a[0]));
+    top.appendChild(div({fontSize:"10px",fontWeight:"700",color:a[1]>=a[2]?"#34d399":a[3]}, a[1] + "/" + a[2]));
+    col.appendChild(top);
+    var track = div({height:"4px",background:"#1e1e2a",borderRadius:"2px"});
+    track.appendChild(div({height:"100%",width:Math.min(100,Math.round(a[1]/a[2]*100))+"%",background:a[1]>=a[2]?"#34d399":a[3],borderRadius:"2px"}));
+    col.appendChild(track); pg.appendChild(col);
+  });
+  pace.appendChild(pg); w.appendChild(pace);
+
+  if (!sigs.length) {
+    var emp = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"28px",textAlign:"center"});
+    emp.appendChild(div({fontSize:"22px",marginBottom:"5px"}, "Target"));
+    emp.appendChild(div({fontSize:"13px",color:"#888",fontWeight:"600"}, "All clear - pipeline healthy"));
+    w.appendChild(emp);
+  }
+  sigs.forEach(function(s, i) {
+    var r = div({display:"flex",alignItems:"center",gap:"10px",background:"#0e0f14",border:"1px solid #1a1a24",borderLeft:"3px solid "+s.col,borderRadius:"9px",padding:"10px 12px",cursor:"pointer",marginBottom:"5px"});
+    r.className = "row-btn anim";
+    r.style.animationDelay = (i * 0.03) + "s";
+    var txt = div({flex:"1",minWidth:"0"});
+    txt.appendChild(div({fontSize:"12px",fontWeight:"600",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}, s.txt));
+    txt.appendChild(div({fontSize:"10px",color:"#666",marginTop:"1px"}, s.sub));
+    r.appendChild(txt);
+    r.appendChild(div({fontSize:"9px",fontWeight:"700",color:s.col,background:s.col+"18",padding:"2px 7px",borderRadius:"100px",border:"1px solid "+s.col+"33",flexShrink:"0"}, s.tag));
+    r.addEventListener("click", (function(contact) { return function() { G.selId = contact.id; G.tab = "overview"; render(); }; })(s.c));
+    w.appendChild(r);
+  });
+  return w;
+}
+
+// ================================================================
+// KANBAN
+// ================================================================
+function renderKanban() {
+  var outer = div({overflowX:"auto",paddingBottom:"8px"});
+  var board = div({display:"flex",gap:"8px",minWidth:"max-content"});
+  STAGES.forEach(function(stage) {
+    var cols = G.contacts.filter(function(c) { return c.stage === stage; });
+    var sc = COLORS[stage];
+    var col = div({width:"192px",background:G.dragOver===stage?sc.bg:"#0e0f14",border:"1px solid "+(G.dragOver===stage?sc.b:"#1a1a24"),borderRadius:"10px",padding:"8px 7px",flexShrink:"0",minHeight:"190px"});
+    col.addEventListener("dragover", function(e) { e.preventDefault(); G.dragOver = stage; renderMain(); });
+    col.addEventListener("drop", function(e) {
+      e.preventDefault();
+      if (G.drag) { updateContact(G.drag, {stage: stage}); G.drag = null; G.dragOver = null; }
+    });
+    var ch = div({display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"7px",padding:"0 2px"});
+    var hl = div({display:"flex",alignItems:"center",gap:"5px"});
+    hl.appendChild(div({width:"6px",height:"6px",borderRadius:"50%",background:sc.d,flexShrink:"0"}));
+    hl.appendChild(div({fontSize:"9px",fontWeight:"700",textTransform:"uppercase",color:sc.d,letterSpacing:"0.06em"}, stage));
+    ch.appendChild(hl);
+    ch.appendChild(div({fontSize:"9px",color:"#444",background:"#13131a",padding:"1px 5px",borderRadius:"100px"}, cols.length));
+    col.appendChild(ch);
+    cols.forEach(function(c) {
+      var card = div({background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"8px",padding:"9px",cursor:"grab",position:"relative",marginBottom:"5px"});
+      card.className = "card";
+      card.draggable = true;
+      card.addEventListener("dragstart", (function(cId) { return function(e) { G.drag = cId; e.dataTransfer.effectAllowed = "move"; }; })(c.id));
+      card.addEventListener("click", (function(cId) { return function() { G.selId = cId; G.tab = "overview"; render(); }; })(c.id));
+      if (c.score >= 2) {
+        var dot = div({position:"absolute",top:"6px",right:"6px",width:"6px",height:"6px",borderRadius:"50%",background:SCORE_COLOR[c.score]});
+        card.appendChild(dot);
+      }
+      var ct = div({display:"flex",alignItems:"center",gap:"7px",marginBottom:"5px"});
+      ct.appendChild(avatar(c.name, sc, 24));
+      var nd = div({minWidth:"0"});
+      nd.appendChild(div({fontSize:"11px",fontWeight:"600",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}, c.name));
+      nd.appendChild(div({fontSize:"9px",color:"#666",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}, c.title));
+      ct.appendChild(nd); card.appendChild(ct);
+      card.appendChild(div({fontSize:"9px",color:"#888",marginBottom:"5px",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}, c.company));
+      if (c.nextStep) card.appendChild(div({fontSize:"8px",color:"#4a9eff",background:"rgba(74,158,255,0.08)",padding:"2px 5px",borderRadius:"4px",marginBottom:"4px",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}, "-> " + c.nextStep));
+      var tags = div({display:"flex",gap:"3px",flexWrap:"wrap"});
+      if (c.value) tags.appendChild(div({fontSize:"8px",color:"#34d399",background:"#34d39910",padding:"1px 4px",borderRadius:"3px"}, fmtVal(c.value)));
+      var pt = (c.tasks||[]).filter(function(t) { return !t.done; }).length;
+      if (pt > 0) tags.appendChild(div({fontSize:"8px",color:"#f5a623",background:"#f5a62310",padding:"1px 4px",borderRadius:"3px"}, "Tasks:" + pt));
+      var d = daysAgo(c.lastContact);
+      if (d !== null && d >= 7 && !["Closed Won","Closed Lost"].includes(c.stage)) tags.appendChild(div({fontSize:"8px",color:"#f87171",background:"#f8717110",padding:"1px 4px",borderRadius:"3px"}, d + "d cold"));
+      var dh2 = dealHealth(c);
+      if (dh2 !== null) {
+        var dhColor2 = dh2>=70?"#34d399":dh2>=40?"#f5a623":"#f87171";
+        tags.appendChild(div({fontSize:"8px",color:dhColor2,background:dhColor2+"10",padding:"1px 4px",borderRadius:"3px"}, dh2+"%"));
+      }
+      var icp2 = icpScore(c);
+      var icpC2 = icpColor(icp2);
+      tags.appendChild(div({fontSize:"8px",color:icpC2,background:icpC2+"10",padding:"1px 4px",borderRadius:"3px"}, "ICP "+icp2+"%"));
+      card.appendChild(tags); col.appendChild(card);
+    });
+    if (!cols.length) col.appendChild(div({color:"#252535",fontSize:"10px",textAlign:"center",padding:"12px 0",border:"1px dashed #1a1a24",borderRadius:"7px"}, "Drop here"));
+    board.appendChild(col);
+  });
+  outer.appendChild(board); return outer;
+}
+
+// ================================================================
+// CONTACTS
+// ================================================================
+function renderContacts() {
+  var w = div({});
+  var sortV = "score", filterV = "all", searchV = "";
+
+  var ctrl = div({display:"flex",gap:"7px",marginBottom:"10px",flexWrap:"wrap"});
+  var si = mkInput("", function(v) { searchV = v; rebuild(); }, {flex:"1",minWidth:"150px"});
+  si.placeholder = "Search contacts...";
+  ctrl.appendChild(si);
+  ctrl.appendChild(mkSelect("score", [["score","By Score"],["value","By Value"],["recent","By Recent"]], function(v) { sortV = v; rebuild(); }, {width:"auto",padding:"7px 9px"}));
+  ctrl.appendChild(mkSelect("all", [["all","All stages"]].concat(STAGES.map(function(s) { return [s, s]; })), function(v) { filterV = v; rebuild(); }, {width:"auto",padding:"7px 9px"}));
+  w.appendChild(ctrl);
+
+  var tw = div({background:"#0e0f14",borderRadius:"10px",border:"1px solid #1a1a24",overflow:"hidden"});
+  var hd = div({display:"grid",gridTemplateColumns:"2fr 1.3fr 1fr 0.7fr 0.7fr",padding:"7px 12px",background:"#13131a",borderBottom:"1px solid #1a1a24"});
+  ["Contact","Company","Stage","Score","Last"].forEach(function(h) {
+    hd.appendChild(div({fontSize:"9px",color:"#555",fontWeight:"700",letterSpacing:"0.07em",textTransform:"uppercase"}, h));
+  });
+  tw.appendChild(hd);
+  var tbody = div({});
+  tw.appendChild(tbody); w.appendChild(tw);
+
+  function rebuild() {
+    tbody.innerHTML = "";
+    var f = G.contacts.filter(function(c) {
+      return [c.name,c.company,c.email,c.title].some(function(v) { return v && v.toLowerCase().includes(searchV.toLowerCase()); });
+    });
+    if (filterV !== "all") f = f.filter(function(c) { return c.stage === filterV; });
+    f.sort(function(a,b) {
+      if (sortV === "score") return b.score - a.score;
+      if (sortV === "value") return (parseFloat(b.value)||0) - (parseFloat(a.value)||0);
+      return new Date(b.lastContact||0) - new Date(a.lastContact||0);
+    });
+    f.forEach(function(c) {
+      var sc = COLORS[c.stage], d = daysAgo(c.lastContact);
+      var r = div({display:"grid",gridTemplateColumns:"2fr 1.3fr 1fr 0.7fr 0.7fr",padding:"8px 12px",borderBottom:"1px solid #0f0f16",cursor:"pointer"});
+      r.className = "row-btn";
+      r.addEventListener("click", (function(cId) { return function() { G.selId = cId; G.tab = "overview"; render(); }; })(c.id));
+      var nc = div({display:"flex",alignItems:"center",gap:"8px"});
+      nc.appendChild(avatar(c.name, sc, 23));
+      var nd = div({});
+      nd.appendChild(div({fontSize:"12px",fontWeight:"600"}, c.name));
+      nd.appendChild(div({fontSize:"10px",color:"#666"}, c.title));
+      nc.appendChild(nd); r.appendChild(nc);
+      r.appendChild(div({fontSize:"11px",color:"#aaa"}, c.company));
+      var stCell = div({});
+      var sp = div({fontSize:"9px",fontWeight:"600",padding:"2px 6px",borderRadius:"100px",border:"1px solid",display:"inline-block"});
+      sp.style.color = sc.d; sp.style.borderColor = sc.b; sp.style.background = sc.bg; sp.textContent = c.stage;
+      stCell.appendChild(sp); r.appendChild(stCell);
+      var scD = div({});
+      var scB = div({fontSize:"9px",fontWeight:"700",padding:"1px 6px",borderRadius:"100px",display:"inline-block"});
+      scB.style.color = SCORE_COLOR[c.score||0]; scB.style.background = SCORE_COLOR[c.score||0] + "18";
+      scB.textContent = SCORE_LABEL[c.score||0]; scD.appendChild(scB); r.appendChild(scD);
+      r.appendChild(div({fontSize:"10px",color:d!==null&&d>=7?"#f87171":"#666"}, d!==null ? d+"d" : "-"));
+      tbody.appendChild(r);
+    });
+    if (!f.length) tbody.appendChild(div({color:"#444",fontSize:"12px",textAlign:"center",padding:"24px"}, "No contacts match."));
+  }
+  rebuild(); return w;
+}
+
+// ================================================================
+// TASKS
+// ================================================================
+function renderTasks() {
+  var pend = getPending(), td2 = today();
+  if (!pend.length) return div({color:"#444",fontSize:"13px",textAlign:"center",padding:"48px"}, "No tasks!");
+  var w = div({maxWidth:"620px",display:"flex",flexDirection:"column",gap:"18px"});
+  [["Overdue", pend.filter(function(t) { return t.due < td2; }), "#f87171"],
+   ["Due Today", pend.filter(function(t) { return t.due === td2; }), "#f5a623"],
+   ["Upcoming", pend.filter(function(t) { return t.due > td2; }), "#4a9eff"]
+  ].filter(function(g) { return g[1].length > 0; }).forEach(function(g) {
+    var grp = div({});
+    grp.appendChild(div({fontSize:"9px",fontWeight:"700",textTransform:"uppercase",color:g[2],marginBottom:"6px",letterSpacing:"0.09em"}, g[0] + " - " + g[1].length));
+    g[1].forEach(function(t) {
+      var r = div({display:"flex",alignItems:"center",gap:"8px",padding:"8px 11px",background:"#0e0f14",border:"1px solid #1a1a24",borderLeft:"3px solid "+(t.priority==="high"?g[2]:"#1e1e2a"),borderRadius:"8px",marginBottom:"4px"});
+      var cb = el("button", {on: {click: (function(t2) { return function() {
+        var c = G.contacts.find(function(x) { return x.id === t2.cId; });
+        if (c) updateContact(c.id, {tasks: c.tasks.map(function(x) { return x.id === t2.id ? Object.assign({},x,{done:true}) : x; })});
+      }; })(t)}});
+      Object.assign(cb.style, {width:"16px",height:"16px",borderRadius:"4px",border:"2px solid "+g[2],background:"none",flexShrink:"0"});
+      r.appendChild(cb);
+      var tinfo = div({flex:"1"});
+      tinfo.appendChild(div({fontSize:"12px",fontWeight:"500"}, t.text + (t.priority==="high" ? " [HIGH]" : "")));
+      tinfo.appendChild(mkBtn(t.cName, (function(cId) { return function() { G.selId = cId; G.tab = "overview"; render(); }; })(t.cId), {fontSize:"10px",color:"#4a9eff",background:"none",border:"none",padding:"0",marginTop:"2px",display:"block"}));
+      r.appendChild(tinfo);
+      r.appendChild(div({color:g[2],fontSize:"10px",flexShrink:"0"}, t.due));
+      grp.appendChild(r);
+    });
+    w.appendChild(grp);
+  });
+  return w;
+}
+
+// ================================================================
+// CALENDAR
+// ================================================================
+function renderCal() {
+  var td2 = today();
+  var allM = G.contacts.flatMap(function(c) {
+    return (c.meetings||[]).map(function(m) { return Object.assign({},m,{cName:c.name,cId:c.id}); });
+  }).sort(function(a,b) { return new Date(a.date) - new Date(b.date); });
+  if (!allM.length) return div({color:"#444",fontSize:"13px",textAlign:"center",padding:"48px"}, "No meetings.");
+  var w = div({maxWidth:"620px"});
+  var up = allM.filter(function(m) { return m.date >= td2; });
+  if (up.length) {
+    w.appendChild(sectionTitle("Upcoming - " + up.length, "#34d399"));
+    up.forEach(function(m) {
+      var r = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"9px",padding:"10px 13px",display:"flex",gap:"11px",marginBottom:"5px",alignItems:"flex-start"});
+      var dt = div({width:"46px",flexShrink:"0",textAlign:"center"});
+      dt.appendChild(div({fontSize:"12px",fontWeight:"700"}, new Date(m.date+"T12:00:00").toLocaleDateString("en-CA",{month:"short",day:"numeric"})));
+      dt.appendChild(div({fontSize:"9px",color:"#666"}, m.time||""));
+      r.appendChild(dt);
+      var info = div({flex:"1"});
+      info.appendChild(div({fontSize:"12px",fontWeight:"600"}, m.title));
+      var meta = div({display:"flex",gap:"7px",marginTop:"3px",alignItems:"center"});
+      meta.appendChild(mkBtn(m.cName, (function(cId) { return function() { G.selId = cId; G.tab = "overview"; render(); }; })(m.cId), {fontSize:"10px",color:"#4a9eff",background:"none",border:"none",padding:"0"}));
+      if (m.platform) meta.appendChild(div({fontSize:"9px",color:"#888",background:"#1e1e2a",padding:"2px 6px",borderRadius:"3px"}, m.platform));
+      info.appendChild(meta);
+      if (m.agenda) info.appendChild(div({fontSize:"10px",color:"#666",marginTop:"3px",lineHeight:"1.5"}, m.agenda));
+      r.appendChild(info); w.appendChild(r);
+    });
+  }
+  return w;
+}
+
+// ================================================================
+// STATS
+// ================================================================
+function renderStats() {
+  var st = getStats(), cx = G.contacts, q = G.quota;
+  var w = div({maxWidth:"680px"});
+
+  var kpi = div({display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:"8px",marginBottom:"16px"});
+  [["$"+(st.val/1000).toFixed(1)+"k","Won Revenue","#10b981"],["$"+(st.pipeVal/1000).toFixed(1)+"k","Pipeline","#4a9eff"],[st.winRate+"%","Win Rate",st.winRate>=30?"#10b981":st.winRate>=15?"#f5a623":"#f87171"],["$"+(st.avgDeal/1000).toFixed(1)+"k","Avg Deal","#a78bfa"]].forEach(function(a) {
+    var box = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"12px 13px"});
+    box.appendChild(div({fontSize:"19px",fontWeight:"700",color:a[2]}, a[0]));
+    box.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.07em",marginTop:"2px"}, a[1]));
+    kpi.appendChild(box);
+  });
+  w.appendChild(kpi);
+
+  var ab = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"13px 14px",marginBottom:"12px"});
+  ab.appendChild(sectionTitle("Weekly Activity vs Target"));
+  [["Emails",st.emails,q.emails,"#4a9eff"],["Calls",st.calls,q.calls,"#a78bfa"],["Meetings",st.meetings,q.meetings,"#34d399"]].forEach(function(a) {
+    var r2 = div({marginBottom:"10px"});
+    var tp = div({display:"flex",justifyContent:"space-between",marginBottom:"3px"});
+    tp.appendChild(div({fontSize:"12px"}, a[0]));
+    tp.appendChild(div({fontSize:"12px",fontWeight:"700",color:a[1]>=a[2]?"#34d399":a[3]}, a[1] + " / " + a[2]));
+    r2.appendChild(tp);
+    var track = div({height:"5px",background:"#1e1e2a",borderRadius:"3px"});
+    track.appendChild(div({height:"100%",width:Math.min(100,Math.round(a[1]/a[2]*100))+"%",background:a[1]>=a[2]?"#34d399":a[3],borderRadius:"3px"}));
+    r2.appendChild(track); ab.appendChild(r2);
+  });
+  w.appendChild(ab);
+
+  var sb = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"13px 14px"});
+  sb.appendChild(sectionTitle("Pipeline by Stage"));
+  STAGES.forEach(function(stage) {
+    var n = cx.filter(function(c) { return c.stage === stage; }).length;
+    var sc = COLORS[stage]; if (!n) return;
+    var r2 = div({display:"flex",alignItems:"center",gap:"10px",marginBottom:"6px"});
+    r2.appendChild(div({width:"90px",fontSize:"9px",color:sc.d,fontWeight:"600",textAlign:"right",flexShrink:"0"}, stage));
+    var track = div({flex:"1",height:"14px",background:"#13131a",borderRadius:"4px",overflow:"hidden"});
+    var fill = div({height:"100%",width:Math.round(n/cx.length*100)+"%",background:sc.bg,borderRadius:"4px",display:"flex",alignItems:"center",paddingLeft:"5px"});
+    fill.style.border = "1px solid " + sc.b;
+    fill.appendChild(div({fontSize:"9px",color:sc.d,fontWeight:"700"}, n));
+    track.appendChild(fill); r2.appendChild(track); sb.appendChild(r2);
+  });
+  w.appendChild(sb);
+
+  // Win / Loss Reasons
+  var wls = getWinLossStats();
+  var hasWL = Object.keys(wls.won).length > 0 || Object.keys(wls.lost).length > 0;
+  if (hasWL) {
+    var wlBox = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"13px 14px",marginTop:"12px"});
+    wlBox.appendChild(sectionTitle("Win / Loss Analysis"));
+    var wlGrid = div({display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"});
+    // Wins
+    var wonDiv = div({});
+    wonDiv.appendChild(div({fontSize:"9px",color:"#34d399",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"7px"}, "Why We Win"));
+    Object.entries(wls.won).sort(function(a,b){return b[1]-a[1];}).forEach(function(pair) {
+      var r2 = div({display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"5px"});
+      r2.appendChild(div({fontSize:"10px",color:"#aaa",flex:"1",marginRight:"8px"}, pair[0]));
+      r2.appendChild(div({fontSize:"10px",fontWeight:"700",color:"#34d399",background:"#34d39910",padding:"1px 6px",borderRadius:"100px",flexShrink:"0"}, pair[1]));
+      wonDiv.appendChild(r2);
+    });
+    if (!Object.keys(wls.won).length) wonDiv.appendChild(div({fontSize:"10px",color:"#444"}, "No wins logged yet"));
+    wlGrid.appendChild(wonDiv);
+    // Losses
+    var lostDiv = div({});
+    lostDiv.appendChild(div({fontSize:"9px",color:"#f87171",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"7px"}, "Why We Lose"));
+    Object.entries(wls.lost).sort(function(a,b){return b[1]-a[1];}).forEach(function(pair) {
+      var r2 = div({display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"5px"});
+      r2.appendChild(div({fontSize:"10px",color:"#aaa",flex:"1",marginRight:"8px"}, pair[0]));
+      r2.appendChild(div({fontSize:"10px",fontWeight:"700",color:"#f87171",background:"#f8717110",padding:"1px 6px",borderRadius:"100px",flexShrink:"0"}, pair[1]));
+      lostDiv.appendChild(r2);
+    });
+    if (!Object.keys(wls.lost).length) lostDiv.appendChild(div({fontSize:"10px",color:"#444"}, "No losses logged yet"));
+    wlGrid.appendChild(lostDiv);
+    wlBox.appendChild(wlGrid);
+    w.appendChild(wlBox);
+  }
+  return w;
+}
+
+// ================================================================
+// DRAWER
+// ================================================================
+function renderDrawer() {
+  var dr = document.getElementById("drawer"); dr.innerHTML = "";
+  if (!G.selId) return;
+  var c = G.contacts.find(function(x) { return x.id === G.selId; }); if (!c) return;
+  var sc = COLORS[c.stage];
+
+  var ov = div({position:"fixed",inset:"0",background:"rgba(0,0,0,0.6)",backdropFilter:"blur(4px)",zIndex:"100",display:"flex",justifyContent:"flex-end"});
+  ov.addEventListener("click", function() { G.selId = null; render(); });
+  var pn = div({width:"420px",background:"#0e0f14",height:"100%",display:"flex",flexDirection:"column",boxShadow:"-6px 0 32px rgba(0,0,0,0.5)"});
+  pn.addEventListener("click", function(e) { e.stopPropagation(); });
+
+  // Header
+  var hdr = div({padding:"13px",display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:"8px",flexShrink:"0"});
+  hdr.style.borderBottom = "1px solid " + sc.b + "22";
+  var hl = div({display:"flex",alignItems:"center",gap:"10px"});
+  hl.appendChild(avatar(c.name, sc, 38));
+  var hi = div({});
+  hi.appendChild(div({fontSize:"15px",fontWeight:"700"}, c.name));
+  hi.appendChild(div({fontSize:"10px",color:"#888",marginTop:"1px"}, c.title + " - " + c.company));
+  var hSels = div({display:"flex",gap:"5px",marginTop:"4px",flexWrap:"wrap"});
+  hSels.appendChild(mkSelect(c.stage, STAGES, function(v) {
+    if (v === "Closed Won" || v === "Closed Lost") {
+      G.pendingStageChange = {id:c.id, stage:v};
+      G.modal = "closeReason";
+      renderModal();
+    } else {
+      updateContact(c.id, {stage:v});
+    }
+  }, {fontSize:"10px",fontWeight:"600",padding:"2px 7px",borderRadius:"5px",border:"1px solid "+sc.b,color:sc.d,background:sc.bg,width:"auto"}));
+  hSels.appendChild(mkSelect(String(c.score||0), [[0,"Cold"],[1,"Warm"],[2,"Hot"],[3,"Urgent"]], function(v) { updateContact(c.id, {score:parseInt(v)}); }, {fontSize:"10px",fontWeight:"600",padding:"2px 7px",borderRadius:"5px",border:"1px solid "+SCORE_COLOR[c.score||0]+"44",color:SCORE_COLOR[c.score||0],background:SCORE_COLOR[c.score||0]+"15",width:"auto"}));
+  if (!["Closed Won","Closed Lost"].includes(c.stage)) {
+    var fc = c.forecastCat || "Pipeline";
+    hSels.appendChild(mkSelect(fc, FORECAST_CATS, function(v) { updateContact(c.id, {forecastCat:v}); }, {fontSize:"10px",fontWeight:"600",padding:"2px 7px",borderRadius:"5px",border:"1px solid "+(FORECAST_COLORS[fc]||"#555")+"44",color:FORECAST_COLORS[fc]||"#555",background:(FORECAST_COLORS[fc]||"#555")+"15",width:"auto"}));
+  }
+  hi.appendChild(hSels); hl.appendChild(hi); hdr.appendChild(hl);
+  var hBtns = div({display:"flex",gap:"4px",flexShrink:"0"});
+  hBtns.appendChild(mkBtn("Edit", function() { G.editing = !G.editing; G.draft = Object.assign({},c); render(); }, {width:"25px",height:"25px",display:"grid",placeItems:"center",background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"6px",color:"#888",fontSize:"10px"}));
+  hBtns.appendChild(mkBtn("Del", function() { if (confirm("Delete " + c.name + "?")) deleteContact(c.id); }, {width:"25px",height:"25px",display:"grid",placeItems:"center",background:"rgba(248,113,113,0.08)",border:"1px solid rgba(248,113,113,0.2)",borderRadius:"6px",color:"#f87171",fontSize:"10px"}));
+  hBtns.appendChild(mkBtn("X", function() { G.selId = null; render(); }, {width:"25px",height:"25px",display:"grid",placeItems:"center",background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"6px",color:"#888",fontSize:"10px"}));
+  hdr.appendChild(hBtns); pn.appendChild(hdr);
+
+  // Next step
+  var ns = div({padding:"6px 13px",background:"rgba(74,158,255,0.05)",borderBottom:"1px solid #1a1a24",flexShrink:"0",display:"flex",alignItems:"center",gap:"7px"});
+  ns.appendChild(div({fontSize:"10px",color:"#4a9eff"}, "->"));
+  var nsi = mkInput(c.nextStep||"", function(v) { updateContact(c.id, {nextStep:v}); }, {flex:"1",background:"none",border:"none",color:"#4a9eff",fontSize:"11px",fontWeight:"600",width:"auto"});
+  nsi.placeholder = "Next step...";
+  ns.appendChild(nsi); pn.appendChild(ns);
+
+  // Tabs
+  var tabBar = div({display:"flex",padding:"0 10px",borderBottom:"1px solid #1a1a24",flexShrink:"0",overflowX:"auto"});
+  var tabDefs = [["overview","Overview"],["bant","BANT"],["coach","AI Coach"],["ai","AI Email"],["emails","Emails"],["calls","Calls"],["callsummary","Call Summary"],["tasks","Tasks"],["meetings","Meetings"],["objections","Objections"],["competitors","Competitors"],["handoff","Handoff"],["sequence","Sequence"]];
+  tabDefs.forEach(function(pair) {
+    var tid = pair[0], tlbl = pair[1], active = G.tab === tid;
+    var b = mkBtn(tlbl, function() { G.tab = tid; G.editing = false; render(); }, {
+      padding:"7px 8px",background:"none",border:"none",
+      borderBottom:"2px solid "+(active?(tid==="ai"?"#a78bfa":sc.d):"transparent"),
+      color:active?(tid==="ai"?"#a78bfa":sc.d):"#666",fontSize:"9px",fontWeight:"600",whiteSpace:"nowrap"
+    });
+    tabBar.appendChild(b);
+  });
+  pn.appendChild(tabBar);
+
+  var body = div({flex:"1",overflowY:"auto",padding:"11px"});
+  var tabFns = {
+    overview: function() { return renderOverviewTab(c, sc); },
+    ai: function() { return renderAIEmailTab(c); },
+    emails: function() { return renderEmailsTab(c); },
+    calls: function() { return renderCallsTab(c); },
+    tasks: function() { return renderTasksTab(c); },
+    meetings: function() { return renderMeetingsTab(c); },
+    objections: function() { return renderObjectionsTab(c); },
+    handoff: function() { return renderHandoffTab(c); },
+    sequence: function() { return renderSequenceTab(c); },
+    bant: function() { return renderBANTTab(c); },
+    coach: function() { return renderCoachTab(c); },
+    competitors: function() { return renderCompetitorsTab(c); },
+    callsummary: function() { return renderCallSummaryTab(c); }
+  };
+  if (tabFns[G.tab]) body.appendChild(tabFns[G.tab]());
+  pn.appendChild(body); ov.appendChild(pn); dr.appendChild(ov);
+}
+
+function renderOverviewTab(c, sc) {
+  var w = div({});
+  if (G.editing && G.draft) {
+    var draft = G.draft;
+    [["name","Name"],["title","Title"],["company","Company"],["email","Email"],["phone","Phone"],["value","Deal Value"],["source","Source"],["industry","Industry"]].forEach(function(pair) {
+      var k = pair[0], l = pair[1];
+      var label = mkLabel(l, mkInput(draft[k]||"", function(v) { draft[k] = v; }));
+      w.appendChild(label); w.appendChild(div({height:"6px"}));
+    });
+    var notesLabel = mkLabel("Notes", mkTextarea(draft.notes||"", function(v) { draft.notes = v; }));
+    w.appendChild(notesLabel); w.appendChild(div({height:"8px"}));
+    var btns = div({display:"flex",gap:"6px"});
+    btns.appendChild(mkBtn("Save", function() { updateContact(c.id, draft); G.editing = false; G.draft = null; }, {padding:"7px 14px",borderRadius:"7px",background:"linear-gradient(135deg,#4a9eff,#a78bfa)",border:"none",color:"#fff",fontSize:"11px",fontWeight:"700"}));
+    btns.appendChild(mkBtn("Cancel", function() { G.editing = false; G.draft = null; render(); }, {padding:"7px 12px",borderRadius:"7px",background:"#13131a",border:"1px solid #1e1e2a",color:"#888",fontSize:"11px"}));
+    w.appendChild(btns);
+  } else {
+    var icpS = icpScore(c); var icpC = icpColor(icpS);
+    var icpRow = div({display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:"1px solid #0f0f16"});
+    icpRow.appendChild(div({fontSize:"11px",color:"#666"}, "ICP Fit"));
+    var icpBadge = div({display:"flex",alignItems:"center",gap:"6px"});
+    var icpBar = div({width:"60px",height:"4px",background:"#1e1e2a",borderRadius:"2px"});
+    icpBar.appendChild(div({height:"100%",width:icpS+"%",background:icpC,borderRadius:"2px"}));
+    icpBadge.appendChild(icpBar);
+    icpBadge.appendChild(div({fontSize:"11px",fontWeight:"700",color:icpC}, icpS+"%"));
+    icpRow.appendChild(icpBadge);
+    w.appendChild(icpRow);
+    [["Email",c.email||"-"],["Phone",c.phone||"-"],["Value",fmtVal(c.value)],["Source",c.source||"-"],["Industry",c.industry||"-"],["Last Contact",c.lastContact||"Never"]].forEach(function(pair) {
+      w.appendChild(infoRow(pair[0], pair[1]));
+    });
+    if (c.notes) {
+      var nb = div({marginTop:"10px"});
+      nb.appendChild(sectionTitle("Notes"));
+      nb.appendChild(div({fontSize:"11px",color:"#aaa",lineHeight:"1.7"}, c.notes));
+      w.appendChild(nb);
+    }
+  }
+  return w;
+}
+
+function renderEmailsTab(c) {
+  var w = div({});
+  w.appendChild(addRowBtn("Log Email", function() { G.modal = "logEmail"; renderModal(); }));
+  if (!(c.emails||[]).length) { w.appendChild(div({color:"#444",fontSize:"12px",textAlign:"center",padding:"18px"}, "No emails.")); return w; }
+  c.emails.slice().reverse().forEach(function(e) {
+    var r = div({padding:"8px 0",borderBottom:"1px solid #0f0f16"});
+    r.appendChild(div({fontSize:"9px",fontWeight:"700",color:e.direction==="in"?"#34d399":"#4a9eff",marginBottom:"2px"}, e.direction==="in"?"Inbound":"Outbound"));
+    r.appendChild(div({fontSize:"11px",fontWeight:"600"}, e.subject));
+    r.appendChild(div({fontSize:"10px",color:"#888",lineHeight:"1.5"}, e.preview));
+    r.appendChild(div({fontSize:"9px",color:"#555",marginTop:"1px"}, e.date));
+    w.appendChild(r);
+  });
+  return w;
+}
+
+function renderCallsTab(c) {
+  var w = div({});
+  w.appendChild(addRowBtn("Log Call", function() { G.modal = "logCall"; renderModal(); }));
+  if (!(c.calls||[]).length) { w.appendChild(div({color:"#444",fontSize:"12px",textAlign:"center",padding:"18px"}, "No calls.")); return w; }
+  c.calls.slice().reverse().forEach(function(l) {
+    var r = div({background:"#13131a",borderRadius:"8px",padding:"9px 10px",marginBottom:"6px"});
+    var top = div({display:"flex",justifyContent:"space-between",marginBottom:"3px"});
+    top.appendChild(div({fontSize:"9px",fontWeight:"700",color:"#a78bfa"}, l.date + " - " + (l.duration||"")));
+    if (l.sentiment) {
+      var sb = div({fontSize:"9px",padding:"1px 6px",borderRadius:"100px"}, l.sentiment);
+      sb.style.color = l.sentiment==="positive"?"#34d399":l.sentiment==="negative"?"#f87171":"#f5a623";
+      sb.style.background = l.sentiment==="positive"?"#34d39915":l.sentiment==="negative"?"#f8717115":"#f5a62315";
+      top.appendChild(sb);
+    }
+    r.appendChild(top);
+    r.appendChild(div({fontSize:"11px",color:"#aaa",lineHeight:"1.6"}, l.notes||""));
+    if (l.nextAction) r.appendChild(div({fontSize:"10px",color:"#4a9eff",marginTop:"4px"}, "-> " + l.nextAction));
+    w.appendChild(r);
+  });
+  return w;
+}
+
+function renderTasksTab(c) {
+  var w = div({});
+  w.appendChild(addRowBtn("Add Task", function() { G.modal = "addTask"; renderModal(); }));
+  if (!(c.tasks||[]).length) { w.appendChild(div({color:"#444",fontSize:"12px",textAlign:"center",padding:"18px"}, "No tasks.")); return w; }
+  c.tasks.forEach(function(t) {
+    var ov = !t.done && t.due < today();
+    var r = div({display:"flex",alignItems:"center",gap:"8px",padding:"8px 9px",background:"#13131a",borderRadius:"7px",marginBottom:"4px"});
+    var cb = el("button", {on: {click: (function(t2) { return function() {
+      updateContact(c.id, {tasks: c.tasks.map(function(x) { return x.id===t2.id ? Object.assign({},x,{done:!x.done}) : x; })});
+    }; })(t)}});
+    Object.assign(cb.style, {width:"15px",height:"15px",borderRadius:"4px",border:"2px solid "+(t.done?"#34d399":ov?"#f87171":"#555"),background:"none",color:t.done?"#34d399":"transparent",fontSize:"9px"});
+    cb.textContent = t.done ? "v" : "";
+    r.appendChild(cb);
+    r.appendChild(div({flex:"1",fontSize:"11px",fontWeight:"500",textDecoration:t.done?"line-through":"none",opacity:t.done?"0.4":"1"}, t.text + (t.priority==="high"&&!t.done?" [HIGH]":"")));
+    r.appendChild(div({fontSize:"9px",color:ov?"#f87171":"#666",flexShrink:"0"}, t.due));
+    w.appendChild(r);
+  });
+  return w;
+}
+
+function renderMeetingsTab(c) {
+  var w = div({});
+  w.appendChild(addRowBtn("Add Meeting", function() { G.modal = "addMeeting"; renderModal(); }));
+  if (!(c.meetings||[]).length) { w.appendChild(div({color:"#444",fontSize:"12px",textAlign:"center",padding:"18px"}, "No meetings.")); return w; }
+  c.meetings.forEach(function(m) {
+    var r = div({background:"#13131a",borderRadius:"8px",padding:"9px 10px",marginBottom:"6px"});
+    r.appendChild(div({fontSize:"9px",fontWeight:"700",color:"#34d399",marginBottom:"2px"}, m.date + " - " + (m.time||"") + (m.platform?" - "+m.platform:"")));
+    r.appendChild(div({fontSize:"11px",fontWeight:"600"}, m.title));
+    if (m.agenda) r.appendChild(div({fontSize:"10px",color:"#666",marginTop:"3px",lineHeight:"1.5"}, m.agenda));
+    w.appendChild(r);
+  });
+  return w;
+}
+
+function renderObjectionsTab(c) {
+  var w = div({});
+  var bn = div({background:"linear-gradient(135deg,rgba(248,113,113,0.08),rgba(245,166,35,0.06))",border:"1px solid rgba(248,113,113,0.2)",borderRadius:"9px",padding:"9px 11px",marginBottom:"11px"});
+  bn.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#f87171",marginBottom:"1px"}, "Objection Handler"));
+  bn.appendChild(div({fontSize:"10px",color:"#888"}, "Log objections, get AI-powered responses."));
+  w.appendChild(bn);
+
+  var addRow = div({display:"flex",gap:"7px",marginBottom:"11px"});
+  var addInput = mkInput("", function(){}, {flex:"1"});
+  addInput.placeholder = "Add objection...";
+  addRow.appendChild(addInput);
+  addRow.appendChild(mkBtn("Add", function() {
+    var txt = addInput.value.trim();
+    if (!txt) return;
+    updateContact(c.id, {objections: (c.objections||[]).concat([{id:"o_"+Date.now(),text:txt,resolved:false}])});
+    addInput.value = "";
+  }, {padding:"7px 11px",borderRadius:"7px",background:"#f8717118",border:"1px solid rgba(248,113,113,0.25)",color:"#f87171",fontSize:"11px",fontWeight:"600"}));
+  w.appendChild(addRow);
+
+  if (!(c.objections||[]).length) { w.appendChild(div({color:"#444",fontSize:"12px",textAlign:"center",padding:"18px"}, "No objections logged.")); return w; }
+
+  c.objections.forEach(function(obj) {
+    var box = div({background:"#13131a",borderRadius:"9px",padding:"10px 11px",marginBottom:"7px"});
+    box.style.border = "1px solid " + (obj.resolved ? "#34d39922" : "#1e1e2a");
+    var top = div({display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:"8px",marginBottom:"5px"});
+    top.appendChild(div({fontSize:"11px",fontWeight:"600",flex:"1",textDecoration:obj.resolved?"line-through":"none",opacity:obj.resolved?"0.5":"1"}, obj.text));
+    var btns = div({display:"flex",gap:"4px",flexShrink:"0"});
+    btns.appendChild(mkBtn(obj.resolved?"Done":"Resolve", (function(objId) { return function() {
+      updateContact(c.id, {objections: c.objections.map(function(x) { return x.id===objId ? Object.assign({},x,{resolved:!x.resolved}) : x; })});
+    }; })(obj.id), {padding:"2px 7px",borderRadius:"4px",background:obj.resolved?"#34d39915":"#1e1e2a",border:"1px solid "+(obj.resolved?"#34d39933":"#2a2a3a"),color:obj.resolved?"#34d399":"#666",fontSize:"9px",fontWeight:"600"}));
+    var handleBtn = mkBtn("AI Handle", null, {padding:"2px 7px",borderRadius:"4px",background:"rgba(167,139,250,0.08)",border:"1px solid rgba(167,139,250,0.2)",color:"#a78bfa",fontSize:"9px",fontWeight:"600"});
+    handleBtn.addEventListener("click", function() {
+      handleBtn.textContent = "..."; handleBtn.disabled = true;
+      callAI("B2B sales coach. Return ONLY JSON: {\"response\":\"...\",\"technique\":\"...\"}",
+        "Objection: " + obj.text + "\nContact: " + c.name + ", " + c.title + " at " + c.company
+      ).then(function(txt) {
+        try {
+          var p = JSON.parse(txt);
+          var rd = div({background:"rgba(167,139,250,0.06)",border:"1px solid rgba(167,139,250,0.15)",borderRadius:"7px",padding:"8px 10px",marginTop:"5px"});
+          if (p.technique) rd.appendChild(div({fontSize:"9px",color:"#a78bfa",fontWeight:"700",marginBottom:"3px",textTransform:"uppercase"}, "Technique: " + p.technique));
+          rd.appendChild(div({fontSize:"11px",color:"#ccc",lineHeight:"1.6"}, p.response));
+          box.appendChild(rd);
+        } catch(e) {}
+        handleBtn.textContent = "AI Handle"; handleBtn.disabled = false;
+      }).catch(function() { handleBtn.textContent = "AI Handle"; handleBtn.disabled = false; });
+    });
+    btns.appendChild(handleBtn); top.appendChild(btns); box.appendChild(top); w.appendChild(box);
+  });
+  return w;
+}
+
+function renderHandoffTab(c) {
+  var w = div({});
+  var bn = div({background:"linear-gradient(135deg,rgba(52,211,153,0.08),rgba(74,158,255,0.06))",border:"1px solid rgba(52,211,153,0.2)",borderRadius:"9px",padding:"9px 11px",marginBottom:"11px"});
+  bn.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#34d399",marginBottom:"1px"}, "SDR to AE Handoff"));
+  bn.appendChild(div({fontSize:"10px",color:"#888"}, "Ensure nothing falls through the cracks."));
+  w.appendChild(bn);
+
+  var items = [
+    {id:1,text:"Pain points documented",done:!!(c.notes)},
+    {id:2,text:"Budget discussed",done:false},
+    {id:3,text:"Timeline established",done:false},
+    {id:4,text:"Decision maker identified",done:false},
+    {id:5,text:"Competition noted",done:(c.objections||[]).length>0},
+    {id:6,text:"Next steps agreed",done:!!(c.nextStep)},
+    {id:7,text:"Meeting notes shared",done:false},
+    {id:8,text:"CRM fully updated",done:true}
+  ];
+  var checked = {};
+  items.forEach(function(item) { checked[item.id] = item.done; });
+
+  var pw = div({marginBottom:"11px"});
+  var pt = div({display:"flex",justifyContent:"space-between",marginBottom:"4px"});
+  pt.appendChild(div({fontSize:"11px",fontWeight:"600"}, "Readiness"));
+  var pctEl = div({fontSize:"11px",fontWeight:"700"});
+  pw.appendChild(pt); pw.appendChild(pctEl);
+  var pTrack = div({height:"5px",background:"#1e1e2a",borderRadius:"3px",marginTop:"4px"});
+  var pFill = div({height:"100%",borderRadius:"3px"});
+  pTrack.appendChild(pFill); pw.appendChild(pTrack); w.appendChild(pw);
+
+  var checkEls = {};
+  function updatePct() {
+    var done = Object.values(checked).filter(Boolean).length;
+    var pct = Math.round(done / items.length * 100);
+    pctEl.textContent = pct + "%";
+    pctEl.style.color = pct>=80?"#34d399":pct>=50?"#f5a623":"#f87171";
+    pFill.style.width = pct + "%";
+    pFill.style.background = pct>=80?"#34d399":pct>=50?"#f5a623":"#f87171";
+  }
+
+  items.forEach(function(item) {
+    var r = div({display:"flex",alignItems:"center",gap:"8px",padding:"7px 9px",background:"#13131a",borderRadius:"7px",marginBottom:"4px"});
+    var cb = el("button", {on: {click: (function(iid) { return function() {
+      checked[iid] = !checked[iid];
+      checkEls[iid].textContent = checked[iid] ? "v" : "";
+      checkEls[iid].style.borderColor = checked[iid] ? "#34d399" : "#555";
+      checkEls[iid].style.color = checked[iid] ? "#34d399" : "transparent";
+      updatePct();
+    }; })(item.id)}});
+    Object.assign(cb.style, {width:"15px",height:"15px",borderRadius:"4px",border:"2px solid "+(checked[item.id]?"#34d399":"#555"),background:"none",fontSize:"9px",color:checked[item.id]?"#34d399":"transparent"});
+    cb.textContent = checked[item.id] ? "v" : "";
+    checkEls[item.id] = cb;
+    r.appendChild(cb);
+    r.appendChild(div({fontSize:"11px",fontWeight:"500",textDecoration:checked[item.id]?"line-through":"none",opacity:checked[item.id]?"0.5":"1"}, item.text));
+    w.appendChild(r);
+  });
+  updatePct();
+
+  var genBtn = mkBtn("Generate Handoff Note", null, {padding:"9px",borderRadius:"8px",background:"linear-gradient(135deg,#34d399,#4a9eff)",border:"none",color:"#fff",fontSize:"12px",fontWeight:"700",width:"100%",marginTop:"10px"});
+  genBtn.addEventListener("click", function() {
+    genBtn.textContent = "Generating..."; genBtn.disabled = true;
+    callAI("Generate a 3-4 sentence SDR-to-AE handoff note. Plain text only.",
+      "Contact: " + c.name + ", " + c.title + " at " + c.company + "\nStage: " + c.stage + "\nNotes: " + (c.notes||"none") + "\nNext step: " + (c.nextStep||"none")
+    ).then(function(txt) {
+      var nb = div({background:"#13131a",border:"1px solid rgba(52,211,153,0.25)",borderRadius:"9px",padding:"10px 11px",marginTop:"8px"});
+      nb.appendChild(sectionTitle("Handoff Note", "#34d399"));
+      nb.appendChild(div({fontSize:"11px",color:"#ccc",lineHeight:"1.7"}, txt));
+      nb.appendChild(mkBtn("Copy", function() { navigator.clipboard.writeText(txt); }, {marginTop:"7px",padding:"3px 9px",borderRadius:"5px",background:"#1e1e2a",border:"1px solid #2a2a3a",color:"#888",fontSize:"9px",fontWeight:"600"}));
+      w.appendChild(nb);
+      genBtn.textContent = "Generate Handoff Note"; genBtn.disabled = false;
+    }).catch(function() { genBtn.textContent = "Generate Handoff Note"; genBtn.disabled = false; });
+  });
+  w.appendChild(genBtn); return w;
+}
+
+function renderSequenceTab(c) {
+  var w = div({});
+  var seqs = c.sequences||[], active = seqs.find(function(s) { return s.active; });
+  var SCOL = {pending:"#555",sent:"#4a9eff",replied:"#34d399",skipped:"#f87171"};
+
+  var bn = div({background:"linear-gradient(135deg,rgba(167,139,250,0.1),rgba(74,158,255,0.06))",border:"1px solid rgba(167,139,250,0.2)",borderRadius:"9px",padding:"9px 11px",marginBottom:"10px"});
+  bn.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#a78bfa",marginBottom:"1px"}, "Sequence Builder"));
+  bn.appendChild(div({fontSize:"10px",color:"#888"}, "AI-generates a 5-step cadence for " + c.name + "."));
+  w.appendChild(bn);
+
+  if (!active) {
+    var genBtn = mkBtn("Generate 5-Step Sequence", null, {padding:"10px",borderRadius:"9px",background:"linear-gradient(135deg,#a78bfa,#4a9eff)",border:"none",color:"#fff",fontSize:"12px",fontWeight:"700",width:"100%"});
+    genBtn.addEventListener("click", function() {
+      genBtn.textContent = "Generating..."; genBtn.disabled = true;
+      callAI(
+        "Elite B2B copywriter. Generate 5-step email sequence. Return ONLY JSON: {\"id\":\"s1\",\"name\":\"Sequence name\",\"active\":true,\"createdDate\":\"2026-03-13\",\"steps\":[{\"day\":1,\"type\":\"email\",\"subject\":\"...\",\"body\":\"...\",\"status\":\"pending\"},{\"day\":3,\"type\":\"linkedin\",\"subject\":\"LinkedIn Connect\",\"body\":\"short note\",\"status\":\"pending\"},{\"day\":5,\"type\":\"email\",\"subject\":\"...\",\"body\":\"...\",\"status\":\"pending\"},{\"day\":10,\"type\":\"email\",\"subject\":\"...\",\"body\":\"...\",\"status\":\"pending\"},{\"day\":14,\"type\":\"email\",\"subject\":\"Break-up\",\"body\":\"...\",\"status\":\"pending\"}]}. Each email under 100 words.",
+        "Contact: " + c.name + ", " + c.title + " at " + c.company + ". Stage: " + c.stage + ". Notes: " + (c.notes||"none") + ".",
+        1000
+      ).then(function(txt) {
+        var sq = JSON.parse(txt);
+        sq.id = "sq_" + Date.now();
+        sq.createdDate = today();
+        updateContact(c.id, {sequences: seqs.map(function(s) { return Object.assign({},s,{active:false}); }).concat([sq])});
+      }).catch(function() { genBtn.textContent = "Generate 5-Step Sequence"; genBtn.disabled = false; });
+    });
+    w.appendChild(genBtn);
+  } else {
+    var sb = div({background:"#13131a",border:"1px solid rgba(167,139,250,0.25)",borderRadius:"10px",overflow:"hidden"});
+    var sh = div({padding:"8px 11px",borderBottom:"1px solid #1e1e2a",display:"flex",alignItems:"center",justifyContent:"space-between"});
+    var si = div({});
+    si.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#a78bfa"}, active.name));
+    si.appendChild(div({fontSize:"9px",color:"#666"}, active.createdDate + " - " + active.steps.filter(function(s) { return s.status==="sent"; }).length + "/" + active.steps.length + " sent"));
+    sh.appendChild(si);
+    sh.appendChild(mkBtn("Stop", function() {
+      updateContact(c.id, {sequences: seqs.map(function(s) { return s.id===active.id ? Object.assign({},s,{active:false}) : s; })});
+    }, {padding:"3px 7px",borderRadius:"5px",background:"rgba(248,113,113,0.08)",border:"1px solid rgba(248,113,113,0.2)",color:"#f87171",fontSize:"9px"}));
+    sb.appendChild(sh);
+
+    active.steps.forEach(function(step, i) {
+      var sd = div({padding:"8px 11px",borderBottom:i<active.steps.length-1?"1px solid #111118":"none"});
+      var st2 = div({display:"flex",alignItems:"center",gap:"7px",marginBottom:"3px"});
+      var icon = div({width:"20px",height:"20px",borderRadius:"4px",display:"grid",placeItems:"center",fontSize:"9px",flexShrink:"0"}, step.type==="linkedin"?"in":"@");
+      icon.style.background = SCOL[step.status] + "18";
+      icon.style.border = "1px solid " + SCOL[step.status] + "44";
+      st2.appendChild(icon);
+      var si2 = div({flex:"1"});
+      si2.appendChild(div({fontSize:"10px",fontWeight:"700"}, "Day " + step.day + " - " + step.subject));
+      si2.appendChild(div({fontSize:"8px",fontWeight:"700",textTransform:"uppercase",color:SCOL[step.status]}, step.status));
+      st2.appendChild(si2); sd.appendChild(st2);
+      sd.appendChild(div({fontSize:"10px",color:"#888",lineHeight:"1.6",marginBottom:"5px",paddingLeft:"27px"}, step.body));
+      var mb = div({display:"flex",gap:"4px",paddingLeft:"27px"});
+      ["sent","replied","skipped"].forEach(function(st3) {
+        mb.appendChild(mkBtn(st3, (function(stepIdx, status) { return function() {
+          var newSteps = active.steps.map(function(x, j) { return j===stepIdx ? Object.assign({},x,{status:status}) : x; });
+          updateContact(c.id, {sequences: seqs.map(function(s) { return s.id===active.id ? Object.assign({},s,{steps:newSteps}) : s; })});
+        }; })(i, st3), {padding:"2px 7px",borderRadius:"4px",background:step.status===st3?SCOL[st3]+"18":"#1e1e2a",border:"1px solid "+(step.status===st3?SCOL[st3]+"44":"#2a2a3a"),color:step.status===st3?SCOL[st3]:"#666",fontSize:"8px",fontWeight:"600",textTransform:"capitalize"}));
+      });
+      sd.appendChild(mb); sb.appendChild(sd);
+    });
+
+    var pr = div({padding:"5px 11px",background:"#111118",borderTop:"1px solid #1e1e2a",display:"flex",gap:"2px"});
+    active.steps.forEach(function(step) {
+      pr.appendChild(div({flex:"1",height:"3px",borderRadius:"2px",background:step.status==="sent"?"#4a9eff":step.status==="replied"?"#34d399":step.status==="skipped"?"#f87171":"#2a2a3a"}));
+    });
+    sb.appendChild(pr); w.appendChild(sb);
+  }
+  return w;
+}
+
+function renderAIEmailTab(c) {
+  var w = div({});
+  var aiType = "first-touch", aiTone = "peer", aiSig = "";
+
+  var bn = div({background:"linear-gradient(135deg,rgba(167,139,250,0.1),rgba(74,158,255,0.06))",border:"1px solid rgba(167,139,250,0.2)",borderRadius:"9px",padding:"9px 11px",marginBottom:"10px"});
+  bn.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#a78bfa",marginBottom:"1px"}, "AI Email Generator"));
+  bn.appendChild(div({fontSize:"10px",color:"#888"}, "Personalised email using " + c.name + "'s context."));
+  w.appendChild(bn);
+
+  var typeDiv = div({display:"flex",flexDirection:"column",gap:"3px",marginBottom:"10px"});
+  w.appendChild(div({fontSize:"8px",color:"#555",textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:"700",marginBottom:"5px"}, "Email Type"));
+  var typeBtns = {};
+  [["first-touch","First Touch","Cold, signal-anchored"],["follow-up","Follow-Up","No reply"],["reply-to","Reply Nurture","Keep momentum"],["breakup","Break-Up","Final touch"],["post-meeting","Post-Meeting","After a call"],["proposal","Proposal Follow-up","After sending proposal"]].forEach(function(a) {
+    var id = a[0], l = a[1], d = a[2];
+    var b = div({padding:"6px 8px",borderRadius:"6px",cursor:"pointer",border:"1px solid "+(aiType===id?"#a78bfa":"#1e1e2a"),background:aiType===id?"rgba(167,139,250,0.08)":"#13131a"});
+    var lbl2 = div({fontSize:"10px",fontWeight:"600",color:aiType===id?"#a78bfa":"#ccc"}, l);
+    b.appendChild(lbl2); b.appendChild(div({fontSize:"9px",color:"#555"}, d));
+    typeBtns[id] = {el:b, lbl:lbl2};
+    b.addEventListener("click", function() {
+      aiType = id;
+      Object.keys(typeBtns).forEach(function(k) { typeBtns[k].el.style.border="1px solid #1e1e2a"; typeBtns[k].el.style.background="#13131a"; typeBtns[k].lbl.style.color="#ccc"; });
+      b.style.border = "1px solid #a78bfa"; b.style.background = "rgba(167,139,250,0.08)"; lbl2.style.color = "#a78bfa";
+    });
+    typeDiv.appendChild(b);
+  });
+  w.appendChild(typeDiv);
+
+  var toneDiv = div({display:"grid",gridTemplateColumns:"1fr 1fr",gap:"4px",marginBottom:"10px"});
+  w.appendChild(div({fontSize:"8px",color:"#555",textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:"700",marginBottom:"5px"}, "Tone"));
+  var toneBtns = {};
+  [["peer","Peer","Casual"],["direct","Direct","Punchy"],["curious","Curious","One question"],["challenger","Challenger","Challenge status quo"]].forEach(function(a) {
+    var id = a[0], l = a[1], d = a[2];
+    var b = div({padding:"6px 8px",borderRadius:"6px",cursor:"pointer",border:"1px solid "+(aiTone===id?"#4a9eff":"#1e1e2a"),background:aiTone===id?"rgba(74,158,255,0.08)":"#13131a"});
+    var lbl2 = div({fontSize:"10px",fontWeight:"600",color:aiTone===id?"#4a9eff":"#ccc"}, l);
+    b.appendChild(lbl2); b.appendChild(div({fontSize:"9px",color:"#555"}, d));
+    toneBtns[id] = {el:b, lbl:lbl2};
+    b.addEventListener("click", function() {
+      aiTone = id;
+      Object.keys(toneBtns).forEach(function(k) { toneBtns[k].el.style.border="1px solid #1e1e2a"; toneBtns[k].el.style.background="#13131a"; toneBtns[k].lbl.style.color="#ccc"; });
+      b.style.border = "1px solid #4a9eff"; b.style.background = "rgba(74,158,255,0.08)"; lbl2.style.color = "#4a9eff";
+    });
+    toneDiv.appendChild(b);
+  });
+  w.appendChild(toneDiv);
+
+  w.appendChild(div({fontSize:"8px",color:"#555",textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:"700",marginBottom:"3px"}, "Signal (optional)"));
+  var sigInput = mkInput("", function(v) { aiSig = v; }, {marginBottom:"10px"});
+  sigInput.placeholder = "e.g. " + c.name + " just posted about scaling outbound";
+  w.appendChild(sigInput);
+
+  var genBtn = mkBtn("Generate Email", null, {padding:"9px",borderRadius:"8px",background:"linear-gradient(135deg,#a78bfa,#4a9eff)",border:"none",color:"#fff",fontSize:"12px",fontWeight:"700",width:"100%"});
+  genBtn.addEventListener("click", function() {
+    genBtn.textContent = "Generating..."; genBtn.disabled = true;
+    var TP = {"first-touch":"Cold first-touch, signal-anchored. Under 120 words.","follow-up":"Follow-up, no reply. Reframe value. Under 80 words.","reply-to":"They replied. Move toward meeting. Under 100 words.","breakup":"Break-up email. Under 60 words.","post-meeting":"Post-meeting recap and next steps. Under 120 words.","proposal":"Proposal follow-up. Create urgency. Under 90 words."};
+    var TN = {peer:"Peer tone, casual and warm.",direct:"Direct and punchy, no filler.",curious:"Lead with one sharp question.",challenger:"Challenge their status quo."};
+    var ctx = ["Contact: " + c.name + ", " + c.title + " at " + c.company, c.notes ? "Notes: " + c.notes : "", aiSig ? "Signal: " + aiSig : "", "Stage: " + c.stage].filter(Boolean).join("\n");
+    callAI("Elite B2B copywriter. " + TP[aiType] + " " + TN[aiTone] + " Return ONLY JSON: {\"subject\":\"...\",\"body\":\"...\"}", "Write email:\n" + ctx, 500).then(function(txt) {
+      var res = JSON.parse(txt);
+      var rb = div({background:"#13131a",border:"1px solid rgba(167,139,250,0.25)",borderRadius:"9px",overflow:"hidden",marginTop:"10px"});
+      var rh = div({padding:"7px 10px",borderBottom:"1px solid #1e1e2a",display:"flex",alignItems:"center",justifyContent:"space-between"});
+      rh.appendChild(div({fontSize:"9px",fontWeight:"700",color:"#a78bfa",textTransform:"uppercase",letterSpacing:"0.07em"}, "Result"));
+      var cpBtn = mkBtn("Copy", function() { navigator.clipboard.writeText("Subject: " + res.subject + "\n\n" + res.body); cpBtn.textContent = "Copied!"; setTimeout(function() { cpBtn.textContent = "Copy"; }, 2000); }, {padding:"2px 7px",borderRadius:"4px",background:"#1e1e2a",border:"1px solid #2a2a3a",color:"#aaa",fontSize:"9px",fontWeight:"600"});
+      rh.appendChild(cpBtn); rb.appendChild(rh);
+      var subjDiv = div({padding:"8px 10px 0"});
+      subjDiv.appendChild(div({fontSize:"8px",color:"#555",textTransform:"uppercase",fontWeight:"700",marginBottom:"2px"}, "Subject"));
+      subjDiv.appendChild(div({fontSize:"11px",fontWeight:"600",fontStyle:"italic"}, res.subject));
+      rb.appendChild(subjDiv);
+      var bodyDiv = div({padding:"7px 10px"});
+      bodyDiv.appendChild(div({fontSize:"8px",color:"#555",textTransform:"uppercase",fontWeight:"700",marginBottom:"3px"}, "Body"));
+      bodyDiv.appendChild(div({fontSize:"10px",color:"#ccc",lineHeight:"1.75",whiteSpace:"pre-wrap"}, res.body));
+      rb.appendChild(bodyDiv);
+      var actRow = div({padding:"7px 10px",borderTop:"1px solid #1e1e2a",display:"flex",gap:"5px",flexWrap:"wrap"});
+      var logBtn = mkBtn("Log to Contact", function() {
+        updateContact(c.id, {emails: (c.emails||[]).concat([{id:"e_"+Date.now(),subject:res.subject,preview:res.body.slice(0,100)+"...",date:today(),direction:"out"}]), lastContact: today()});
+        logBtn.textContent = "Logged!"; logBtn.disabled = true;
+        G.tab = "emails"; render();
+      }, {padding:"6px",borderRadius:"6px",background:"rgba(167,139,250,0.1)",border:"1px solid rgba(167,139,250,0.25)",color:"#a78bfa",fontSize:"10px",fontWeight:"600",flex:"1"});
+      actRow.appendChild(logBtn);
+      var saveBtn = mkBtn("Save Template", function(){
+        var templates = getTemplates();
+        templates.push({id:"tmpl_"+Date.now(),name:"Template "+new Date().toLocaleDateString(),type:aiType,subject:res.subject,body:res.body,tags:[aiTone],createdDate:today()});
+        saveTemplates(templates);
+        saveBtn.textContent="Saved!"; setTimeout(function(){saveBtn.textContent="Save Template";},2000);
+      }, {padding:"6px",borderRadius:"6px",background:"rgba(52,211,153,0.1)",border:"1px solid rgba(52,211,153,0.25)",color:"#34d399",fontSize:"10px",fontWeight:"600"});
+      actRow.appendChild(saveBtn);
+      rb.appendChild(actRow); w.appendChild(rb);
+      genBtn.textContent = "Generate Email"; genBtn.disabled = false;
+    }).catch(function() { genBtn.textContent = "Generate Email"; genBtn.disabled = false; });
+  });
+  w.appendChild(genBtn); return w;
+}
+
+// ================================================================
+// MODAL
+// ================================================================
+function renderModal() {
+  var md = document.getElementById("modal"); md.innerHTML = "";
+  if (!G.modal) return;
+  var c = getSelected();
+
+  var ov = div({position:"fixed",inset:"0",background:"rgba(0,0,0,0.75)",backdropFilter:"blur(6px)",zIndex:"200",display:"flex",alignItems:"center",justifyContent:"center",padding:"16px"});
+  ov.addEventListener("click", function() { G.modal = null; md.innerHTML = ""; });
+  var pn = div({background:"#0e0f14",border:"1px solid #1e1e2a",borderRadius:"12px",padding:"17px",width:"100%",maxWidth:"360px",maxHeight:"88vh",overflowY:"auto"});
+  pn.addEventListener("click", function(e) { e.stopPropagation(); });
+
+  function mHead(title) {
+    var h = div({display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"12px"});
+    h.appendChild(div({fontSize:"14px",fontWeight:"700"}, title));
+    h.appendChild(mkBtn("X", function() { G.modal = null; md.innerHTML = ""; }, {width:"24px",height:"24px",display:"grid",placeItems:"center",background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"5px",color:"#888",fontSize:"10px"}));
+    return h;
+  }
+
+  function mField(label2, key, fd, type) {
+    var l = mkLabel(label2);
+    if (type === "textarea") { l.appendChild(mkTextarea(fd[key]||"", function(v) { fd[key] = v; })); }
+    else { l.appendChild(mkInput(fd[key]||"", function(v) { fd[key] = v; }, {}, type||"text")); }
+    return l;
+  }
+
+  function mSelect(label2, key, opts, fd) {
+    return mkLabel(label2, mkSelect(fd[key]||opts[0], opts, function(v) { fd[key] = v; }));
+  }
+
+  function gap() { return div({height:"6px"}); }
+
+  if (G.modal === "addContact") {
+    var fd = {name:"",title:"",company:"",email:"",phone:"",value:"",stage:"Prospecting",source:"",industry:""};
+    pn.appendChild(mHead("Add Contact"));
+    [["name","Name"],["title","Title"],["company","Company"],["email","Email"],["phone","Phone"],["value","Deal Value"],["source","Source"],["industry","Industry"]].forEach(function(p) { pn.appendChild(mField(p[1],p[0],fd)); pn.appendChild(gap()); });
+    pn.appendChild(mSelect("Stage","stage",STAGES,fd)); pn.appendChild(gap());
+    pn.appendChild(accentBtn("Add Contact", function() {
+      if (!fd.name) return;
+      // Duplicate detection
+      var dupes = findDupes(G.contacts, fd.email, fd.company, fd.name);
+      if (dupes.length > 0) {
+        var msg = "Possible duplicate detected:\n";
+        dupes.forEach(function(d){ msg += "- " + d.c.name + " (" + d.c.company + "): " + d.reason + "\n"; });
+        msg += "\nAdd anyway?";
+        if (!confirm(msg)) return;
+      }
+      var newC = Object.assign({calls:[],tasks:[],emails:[],meetings:[],sequences:[],objections:[],nextStep:"",lastContact:null}, fd, {id:"c_"+Date.now()});
+      newC.score = autoScore(newC);
+      G.contacts.push(newC);
+      persist(); G.modal = null; render();
+    }));
+  } else if (G.modal === "logEmail" && c) {
+    var fd = {subject:"",preview:"",date:today(),direction:"out"};
+    pn.appendChild(mHead("Log Email"));
+    [["subject","Subject"],["preview","Preview"],["date","Date","date"]].forEach(function(p) { pn.appendChild(mField(p[1],p[0],fd,p[2])); pn.appendChild(gap()); });
+    pn.appendChild(mSelect("Direction","direction",["out","in"],fd)); pn.appendChild(gap());
+    pn.appendChild(accentBtn("Log Email", function() {
+      if (!fd.subject) return;
+      updateContact(c.id, {emails:(c.emails||[]).concat([Object.assign({id:"e_"+Date.now()},fd)]),lastContact:fd.date||today()});
+      G.modal = null; md.innerHTML = "";
+    }));
+  } else if (G.modal === "logCall" && c) {
+    var fd = {date:today(),duration:"",notes:"",sentiment:"neutral",nextAction:""};
+    pn.appendChild(mHead("Log Call"));
+    [["date","Date","date"],["duration","Duration"],["notes","Notes","textarea"],["nextAction","Next Action"]].forEach(function(p) { pn.appendChild(mField(p[1],p[0],fd,p[2])); pn.appendChild(gap()); });
+    pn.appendChild(mSelect("Sentiment","sentiment",["positive","neutral","negative"],fd)); pn.appendChild(gap());
+    pn.appendChild(accentBtn("Log Call", function() {
+      if (!fd.notes && !fd.duration) return;
+      updateContact(c.id, {calls:(c.calls||[]).concat([Object.assign({id:"l_"+Date.now()},fd)]),lastContact:fd.date||today()});
+      G.modal = null; md.innerHTML = "";
+    }));
+  } else if (G.modal === "addTask" && c) {
+    var fd = {text:"",due:today(),priority:"medium"};
+    pn.appendChild(mHead("Add Task"));
+    [["text","Task"],["due","Due Date","date"]].forEach(function(p) { pn.appendChild(mField(p[1],p[0],fd,p[2])); pn.appendChild(gap()); });
+    pn.appendChild(mSelect("Priority","priority",["high","medium","low"],fd)); pn.appendChild(gap());
+    pn.appendChild(accentBtn("Add Task", function() {
+      if (!fd.text) return;
+      updateContact(c.id, {tasks:(c.tasks||[]).concat([Object.assign({id:"t_"+Date.now(),done:false},fd)])});
+      G.modal = null; md.innerHTML = "";
+    }));
+  } else if (G.modal === "addMeeting" && c) {
+    var fd = {title:"",date:today(),time:"10:00 AM",platform:"Zoom",agenda:""};
+    pn.appendChild(mHead("Add Meeting"));
+    [["title","Title"],["date","Date","date"],["time","Time"],["agenda","Agenda","textarea"]].forEach(function(p) { pn.appendChild(mField(p[1],p[0],fd,p[2])); pn.appendChild(gap()); });
+    pn.appendChild(mSelect("Platform","platform",["Zoom","Google Meet","Teams","Phone","In Person"],fd)); pn.appendChild(gap());
+    pn.appendChild(accentBtn("Add Meeting", function() {
+      if (!fd.title) return;
+      updateContact(c.id, {meetings:(c.meetings||[]).concat([Object.assign({id:"m_"+Date.now()},fd)])});
+      G.modal = null; md.innerHTML = "";
+    }));
+  } else if (G.modal === "quota") {
+    var fd = Object.assign({},G.quota);
+    pn.appendChild(mHead("Set Weekly Targets"));
+    [["emails","Emails per week","number"],["calls","Calls per week","number"],["meetings","Meetings per week","number"]].forEach(function(p) { pn.appendChild(mField(p[1],p[0],fd,p[2])); pn.appendChild(gap()); });
+    pn.appendChild(accentBtn("Save Targets", function() {
+      G.quota = {emails:parseInt(fd.emails)||50,calls:parseInt(fd.calls)||20,meetings:parseInt(fd.meetings)||10};
+      persist(); G.modal = null; render();
+    }));
+  } else if (G.modal === "import") {
+    pn.appendChild(mHead("Import Contacts"));
+    pn.appendChild(div({fontSize:"11px",color:"#666",marginBottom:"10px"}, "Apollo, HubSpot, or Salesforce CSV export"));
+    var dz = div({border:"2px dashed #1e1e2a",borderRadius:"9px",padding:"28px 16px",textAlign:"center",cursor:"pointer",background:"#13131a",marginBottom:"9px"});
+    dz.appendChild(div({fontSize:"22px",marginBottom:"4px"}, "Import"));
+    dz.appendChild(div({fontSize:"13px",fontWeight:"600",color:"#ccc",marginBottom:"2px"}, "Drop CSV or click to browse"));
+    dz.appendChild(div({fontSize:"11px",color:"#666"}, "Auto-maps Apollo, HubSpot, Salesforce columns"));
+    var fi = el("input", {type:"file"});
+    fi.accept = ".csv";
+    fi.style.display = "none";
+    function parseAndImport(file) {
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        var lines = e.target.result.trim().split("\n");
+        if (lines.length < 2) return;
+        var hdrs = lines[0].split(",").map(function(h) { return h.replace(/"/g,"").trim().toLowerCase(); });
+        var added = 0;
+        lines.slice(1).forEach(function(line) {
+          var vals = line.match(/(".*?"|[^,]+)(?=,|$)/g) || [];
+          var o = {};
+          hdrs.forEach(function(h, i) { o[h] = (vals[i]||"").replace(/"/g,"").trim(); });
+          var fname = o["first name"] || "";
+          var lname = o["last name"] || "";
+          var name = (fname && lname) ? fname + " " + lname : o["name"] || o["full name"] || "";
+          if (!name) return;
+          var existing = findDupes(G.contacts, o["email"]||o["work email"]||"", o["company"]||o["company name"]||"", name);
+          if (existing.length === 0) {
+            var nc = {id:"c_"+Date.now()+"_"+Math.random(),name:name,title:o["title"]||o["job title"]||"",company:o["company"]||o["company name"]||"",email:o["email"]||o["work email"]||"",phone:o["phone"]||"",stage:"Prospecting",value:"",notes:"",source:"Import",industry:"",score:0,nextStep:"",calls:[],tasks:[],emails:[],meetings:[],sequences:[],objections:[],lastContact:null};
+            nc.score = autoScore(nc);
+            G.contacts.push(nc);
+            added++;
+          }
+          added++;
+        });
+        persist(); G.modal = null; render();
+      };
+      reader.readAsText(file);
+    }
+    dz.addEventListener("click", function() { fi.click(); });
+    dz.addEventListener("dragover", function(e) { e.preventDefault(); });
+    dz.addEventListener("drop", function(e) { e.preventDefault(); if (e.dataTransfer.files[0]) parseAndImport(e.dataTransfer.files[0]); });
+    fi.addEventListener("change", function(e) { if (e.target.files[0]) parseAndImport(e.target.files[0]); });
+    pn.appendChild(dz); pn.appendChild(fi);
+    pn.appendChild(div({background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"8px",padding:"10px",fontSize:"11px",color:"#666",lineHeight:"1.6"}, "Apollo tip: People > select contacts > Export CSV"));
+
+
+  } else if (G.modal === "icpConfig") {
+    var icp = G.icpConfig || {};
+    var fd = {industries:(icp.industries||[]).join(", "), titles:(icp.titles||[]).join(", "), minDeal:icp.minDeal||5000, maxDeal:icp.maxDeal||50000};
+    pn.appendChild(mHead("Configure ICP Scoring"));
+    pn.appendChild(div({fontSize:"11px",color:"#888",marginBottom:"10px"}, "Define your Ideal Customer Profile. Used to score every contact automatically."));
+    [["industries","Target Industries (comma separated)"],["titles","Target Titles (comma separated)"],["minDeal","Min Deal Size ($)","number"],["maxDeal","Max Deal Size ($)","number"]].forEach(function(p){ pn.appendChild(mField(p[1],p[0],fd,p[2])); pn.appendChild(div({height:"6px"})); });
+    pn.appendChild(accentBtn("Save ICP", function(){
+      G.icpConfig = {industries:fd.industries?fd.industries.split(",").map(function(s){return s.trim();}):[], titles:fd.titles?fd.titles.split(",").map(function(s){return s.trim();}):[], minDeal:parseInt(fd.minDeal)||5000, maxDeal:parseInt(fd.maxDeal)||50000};
+      persist(); G.modal=null; render();
+    }));
+
+  } else if (G.modal === "addTemplate") {
+    var EMAIL_TYPES = ["first-touch","follow-up","reply-to","breakup","post-meeting","proposal","other"];
+    var fd = {name:"", type:"first-touch", subject:"", body:"", tags:""};
+    pn.appendChild(mHead("Save Email Template"));
+    [["name","Template Name"],["subject","Subject Line"],["body","Email Body","textarea"]].forEach(function(p){ pn.appendChild(mField(p[1],p[0],fd,p[2])); pn.appendChild(div({height:"6px"})); });
+    pn.appendChild(mSelect("Email Type","type",EMAIL_TYPES,fd)); pn.appendChild(div({height:"6px"}));
+    pn.appendChild(mField("Tags (comma separated)","tags",fd)); pn.appendChild(div({height:"8px"}));
+    pn.appendChild(accentBtn("Save Template", function(){
+      if (!fd.name || !fd.body) return;
+      var templates = getTemplates();
+      templates.push({id:"tmpl_"+Date.now(), name:fd.name, type:fd.type, subject:fd.subject, body:fd.body, tags:fd.tags?fd.tags.split(",").map(function(t){return t.trim();}):[], createdDate:today()});
+      saveTemplates(templates);
+      G.modal = null; render();
+    }));
+
+  } else if (G.modal === "closeReason") {
+    var isWon = G.pendingStageChange && G.pendingStageChange.stage === "Closed Won";
+    var fd = {reason: ""};
+    var wonReasons = ["Champion pushed it through","Competitive win","Price/value match","Referral","Inbound intent","Strong ROI case","Exec sponsor engaged"];
+    var lostReasons = ["No budget","Went with competitor","No decision / status quo","Bad timing","Wrong contact / no champion","Price too high","Feature gap","Ghosted"];
+    pn.appendChild(mHead(isWon ? "Mark as Closed Won" : "Mark as Closed Lost"));
+    pn.appendChild(div({fontSize:"11px",color:"#888",marginBottom:"12px"}, isWon ? "What drove this win? (helps you replicate it)" : "Why did this deal not close? (helps you improve)"));
+    var reasonGrid = div({display:"grid",gridTemplateColumns:"1fr 1fr",gap:"6px",marginBottom:"12px"});
+    var selectedReason = {val:""};
+    (isWon ? wonReasons : lostReasons).forEach(function(r) {
+      var b = div({padding:"7px 9px",borderRadius:"7px",border:"1px solid #1e1e2a",background:"#13131a",cursor:"pointer",fontSize:"11px",color:"#aaa"});
+      b.textContent = r;
+      b.addEventListener("click", function() {
+        selectedReason.val = r;
+        reasonGrid.querySelectorAll("div").forEach(function(x){ x.style.border="1px solid #1e1e2a"; x.style.color="#aaa"; x.style.background="#13131a"; });
+        b.style.border = "1px solid " + (isWon?"#34d399":"#f87171");
+        b.style.color = isWon?"#34d399":"#f87171";
+        b.style.background = isWon?"rgba(52,211,153,0.08)":"rgba(248,113,113,0.08)";
+      });
+      reasonGrid.appendChild(b);
+    });
+    pn.appendChild(reasonGrid);
+    pn.appendChild(mkLabel("Or type your own", mkInput("", function(v){ selectedReason.val = v; }, {marginBottom:"10px"})));
+    pn.appendChild(div({height:"6px"}));
+    pn.appendChild(accentBtn(isWon?"Confirm Win":"Confirm Loss", function() {
+      if (G.pendingStageChange) {
+        updateContact(G.pendingStageChange.id, {stage:G.pendingStageChange.stage, closeReason:selectedReason.val||"Not specified", closeDate:today()});
+        G.pendingStageChange = null;
+      }
+      G.modal = null; render();
+    }));
+  } else if (G.modal === "setTarget") {
+    var fd = {monthlyTarget: G.quota.monthlyTarget || 10000};
+    pn.appendChild(mHead("Set Monthly Revenue Target"));
+    pn.appendChild(div({fontSize:"11px",color:"#888",marginBottom:"10px"}, "Used to calculate pipeline coverage ratio. Aim for 3x pipeline coverage."));
+    pn.appendChild(mField("Monthly Target ($)", "monthlyTarget", fd, "number"));
+    pn.appendChild(div({height:"8px"}));
+    pn.appendChild(accentBtn("Save Target", function() {
+      G.quota.monthlyTarget = parseInt(fd.monthlyTarget)||10000;
+      persist(); G.modal = null; render();
+    }));
+  }
+
+  ov.appendChild(pn); md.appendChild(ov);
+}
+
+
+
+// ================================================================
+// BANT QUALIFICATION TAB
+// ================================================================
+function renderBANTTab(c) {
+  var w = div({});
+  var bs = bantScore(c);
+  var dh = dealHealth(c);
+
+  // Header banner
+  var bn = div({background:"linear-gradient(135deg,rgba(74,158,255,0.08),rgba(52,211,153,0.06))",border:"1px solid rgba(74,158,255,0.2)",borderRadius:"9px",padding:"9px 11px",marginBottom:"11px"});
+  var bhd = div({display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1px"});
+  bhd.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#4a9eff"}, "BANT Qualification"));
+  var bScore = div({fontSize:"11px",fontWeight:"700",color:bs>=3?"#34d399":bs>=2?"#f5a623":"#f87171"}, bs + "/4");
+  bhd.appendChild(bScore);
+  bn.appendChild(bhd);
+  bn.appendChild(div({fontSize:"10px",color:"#888"}, "Budget, Authority, Need, Timeline  -  qualify every deal before it enters your pipeline."));
+  w.appendChild(bn);
+
+  // Deal health score
+  if (dh !== null) {
+    var dhBox = div({background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"8px",padding:"10px 12px",marginBottom:"11px"});
+    var dhHead = div({display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"});
+    dhHead.appendChild(div({fontSize:"10px",fontWeight:"700",color:"#888",textTransform:"uppercase",letterSpacing:"0.07em"}, "Deal Health Score"));
+    var dhColor = dh>=70?"#34d399":dh>=40?"#f5a623":"#f87171";
+    dhHead.appendChild(div({fontSize:"16px",fontWeight:"700",color:dhColor}, dh + "%"));
+    dhBox.appendChild(dhHead);
+    var dhTrack = div({height:"5px",background:"#1e1e2a",borderRadius:"3px"});
+    var dhFill = div({height:"100%",width:dh+"%",background:dhColor,borderRadius:"3px"});
+    dhTrack.appendChild(dhFill); dhBox.appendChild(dhTrack);
+    dhBox.appendChild(div({fontSize:"9px",color:"#555",marginTop:"4px"}, "Based on BANT completeness, engagement, recency, and stage velocity"));
+    w.appendChild(dhBox);
+  }
+
+  // BANT fields
+  var fields = [
+    {key:"bantBudget", label:"Budget", icon:"$", desc:"Has the prospect confirmed they have budget available?",
+      opts:[["","Unknown"],["confirmed","Confirmed"],["likely","Likely"],["unknown","No Budget"]]},
+    {key:"bantAuthority", label:"Authority", icon:"A", desc:"Are you talking to the decision maker or key influencer?",
+      opts:[["","Unknown"],["decision_maker","Decision Maker"],["influencer","Influencer/Champion"],["unknown","No Authority"]]},
+    {key:"bantNeed", label:"Need", icon:"N", desc:"How strong is the prospect's need for your solution?",
+      opts:[["","Unknown"],["strong","Strong - Active Pain"],["moderate","Moderate - Nice to Have"],["weak","Weak - No Clear Need"]]},
+    {key:"bantTimeline", label:"Timeline", icon:"T", desc:"When are they looking to make a decision or purchase?",
+      opts:[["","Unknown"],["this_quarter","This Quarter"],["next_quarter","Next Quarter"],["unknown","No Timeline"]]}
+  ];
+
+  var bantColors = {
+    bantBudget: {confirmed:"#34d399",likely:"#f5a623",unknown:"#f87171","":"#555"},
+    bantAuthority: {decision_maker:"#34d399",influencer:"#f5a623",unknown:"#f87171","":"#555"},
+    bantNeed: {strong:"#34d399",moderate:"#f5a623",weak:"#f87171","":"#555"},
+    bantTimeline: {this_quarter:"#34d399",next_quarter:"#f5a623",unknown:"#f87171","":"#555"}
+  };
+
+  fields.forEach(function(field) {
+    var cur = c[field.key] || "";
+    var col = bantColors[field.key][cur] || "#555";
+    var box = div({background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"9px",padding:"10px 11px",marginBottom:"8px"});
+    var fHead = div({display:"flex",alignItems:"center",gap:"9px",marginBottom:"6px"});
+    var fIcon = div({width:"22px",height:"22px",borderRadius:"6px",display:"grid",placeItems:"center",fontSize:"10px",fontWeight:"800",flexShrink:"0"});
+    fIcon.style.background = col + "18";
+    fIcon.style.border = "1px solid " + col + "44";
+    fIcon.style.color = col;
+    fIcon.textContent = field.icon;
+    fHead.appendChild(fIcon);
+    var fInfo = div({flex:"1"});
+    fInfo.appendChild(div({fontSize:"11px",fontWeight:"700"}, field.label));
+    fInfo.appendChild(div({fontSize:"9px",color:"#666",marginTop:"1px"}, field.desc));
+    fHead.appendChild(fInfo);
+    box.appendChild(fHead);
+    // Options as button grid
+    var optGrid = div({display:"grid",gridTemplateColumns:"1fr 1fr",gap:"4px"});
+    field.opts.filter(function(o){ return o[0] !== ""; }).forEach(function(opt) {
+      var isSelected = cur === opt[0];
+      var optCol = bantColors[field.key][opt[0]] || "#555";
+      var b = mkBtn(opt[1], (function(fkey, val) { return function() {
+        var patch = {};
+        patch[fkey] = val;
+        updateContact(c.id, patch);
+      }; })(field.key, opt[0]), {
+        padding:"5px 8px",borderRadius:"6px",fontSize:"10px",fontWeight:"600",textAlign:"left",
+        background:isSelected?optCol+"18":"#0e0f14",
+        border:"1px solid "+(isSelected?optCol+"66":"#1a1a24"),
+        color:isSelected?optCol:"#666"
+      });
+      optGrid.appendChild(b);
+    });
+    box.appendChild(optGrid);
+    w.appendChild(box);
+  });
+
+  // Stage velocity
+  var dis = daysInStage(c);
+  if (dis !== null) {
+    var velBox = div({background:"#13131a",border:"1px solid "+(dis>=14?"rgba(248,113,113,0.3)":"#1e1e2a"),borderRadius:"8px",padding:"9px 11px",marginTop:"4px"});
+    var velColor = dis>=21?"#f87171":dis>=14?"#f5a623":"#34d399";
+    var velHead = div({display:"flex",justifyContent:"space-between",alignItems:"center"});
+    velHead.appendChild(div({fontSize:"10px",fontWeight:"700"}, "Stage Velocity"));
+    velHead.appendChild(div({fontSize:"12px",fontWeight:"700",color:velColor}, dis + "d in " + c.stage));
+    velBox.appendChild(velHead);
+    velBox.appendChild(div({fontSize:"9px",color:"#555",marginTop:"3px"}, dis>=14?"Deal may be stalling  -  consider a new angle or re-qualification":"Moving at healthy pace"));
+    w.appendChild(velBox);
+  }
+
+  return w;
+}
+
+// ================================================================
+// CALL QUEUE VIEW
+// ================================================================
+function renderCallQueue() {
+  var td2 = today();
+  // Priority queue: hot/urgent contacts not recently contacted, sorted by score desc then days since contact
+  var queue = G.contacts
+    .filter(function(c) {
+      return !["Closed Won","Closed Lost"].includes(c.stage);
+    })
+    .map(function(c) {
+      var d = daysAgo(c.lastContact);
+      var priority = 0;
+      if (c.score >= 3) priority = 4;
+      else if (c.score >= 2) priority = 3;
+      else if (d === null) priority = 2;
+      else if (d >= 7) priority = 2;
+      else priority = 1;
+      return Object.assign({}, c, {_d: d, _priority: priority});
+    })
+    .sort(function(a,b) {
+      if (b._priority !== a._priority) return b._priority - a._priority;
+      var da = a._d === null ? 9999 : a._d;
+      var db = b._d === null ? 9999 : b._d;
+      return db - da;
+    });
+
+  var w = div({maxWidth:"640px"});
+  var hdr = div({marginBottom:"14px"});
+  hdr.appendChild(div({fontSize:"19px",fontWeight:"700"}, "Today's Call Queue"));
+  hdr.appendChild(div({fontSize:"12px",color:"#888",marginTop:"3px"}, queue.length + " contacts prioritised by score and recency"));
+  w.appendChild(hdr);
+
+  if (!queue.length) {
+    w.appendChild(div({color:"#444",fontSize:"13px",textAlign:"center",padding:"48px"}, "No contacts in queue."));
+    return w;
+  }
+
+  var priorityGroups = [
+    {label:"URGENT - Call now", color:"#a78bfa", items: queue.filter(function(c){ return c._priority === 4; })},
+    {label:"HOT - Call today", color:"#f87171", items: queue.filter(function(c){ return c._priority === 3; })},
+    {label:"FOLLOW UP - Overdue", color:"#f5a623", items: queue.filter(function(c){ return c._priority === 2; })},
+    {label:"PIPELINE - Scheduled", color:"#4a9eff", items: queue.filter(function(c){ return c._priority === 1; })}
+  ];
+
+  priorityGroups.filter(function(g){ return g.items.length > 0; }).forEach(function(group) {
+    w.appendChild(div({fontSize:"9px",fontWeight:"700",color:group.color,textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:"7px",marginTop:"14px"}, group.label + " - " + group.items.length));
+    group.items.forEach(function(c, idx) {
+      var sc = COLORS[c.stage];
+      var r = div({display:"flex",alignItems:"center",gap:"12px",background:"#0e0f14",border:"1px solid #1a1a24",borderLeft:"3px solid "+group.color,borderRadius:"9px",padding:"11px 13px",marginBottom:"5px",cursor:"pointer"});
+      r.className = "row-btn";
+      // Number badge
+      r.appendChild(div({width:"22px",height:"22px",borderRadius:"50%",background:group.color+"18",border:"1px solid "+group.color+"44",display:"grid",placeItems:"center",fontSize:"9px",fontWeight:"700",color:group.color,flexShrink:"0"}, idx+1));
+      // Avatar
+      r.appendChild(avatar(c.name, sc, 34));
+      // Info
+      var info = div({flex:"1",minWidth:"0"});
+      var nameRow = div({display:"flex",alignItems:"center",gap:"8px",marginBottom:"2px"});
+      nameRow.appendChild(div({fontSize:"13px",fontWeight:"700",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}, c.name));
+      var scoreBadge = div({fontSize:"8px",fontWeight:"700",padding:"1px 6px",borderRadius:"100px",flexShrink:"0"}, SCORE_LABEL[c.score||0]);
+      scoreBadge.style.color = SCORE_COLOR[c.score||0];
+      scoreBadge.style.background = SCORE_COLOR[c.score||0] + "18";
+      nameRow.appendChild(scoreBadge);
+      info.appendChild(nameRow);
+      info.appendChild(div({fontSize:"10px",color:"#888"}, c.title + " at " + c.company));
+      if (c.nextStep) info.appendChild(div({fontSize:"9px",color:"#4a9eff",marginTop:"3px"}, "-> " + c.nextStep));
+      r.appendChild(info);
+      // Last contact + stage
+      var meta = div({textAlign:"right",flexShrink:"0"});
+      meta.appendChild(div({fontSize:"9px",color:c._d!==null&&c._d>=7?"#f87171":"#888"}, c._d !== null ? c._d+"d ago" : "Never contacted"));
+      var sp = div({fontSize:"8px",fontWeight:"600",padding:"2px 6px",borderRadius:"100px",border:"1px solid",marginTop:"3px",display:"inline-block"});
+      sp.style.color = sc.d; sp.style.borderColor = sc.b; sp.style.background = sc.bg; sp.textContent = c.stage;
+      meta.appendChild(sp);
+      r.appendChild(meta);
+      // Click to open drawer on calls tab
+      r.addEventListener("click", (function(cId){ return function() { G.selId = cId; G.tab = "calls"; render(); }; })(c.id));
+      w.appendChild(r);
+    });
+  });
+  return w;
+}
+
+// ================================================================
+// CALL SUMMARY TAB (AI Call Summariser)
+// ================================================================
+function renderCallSummaryTab(c) {
+  var w = div({});
+  var bn = div({background:"linear-gradient(135deg,rgba(167,139,250,0.1),rgba(52,211,153,0.06))",border:"1px solid rgba(167,139,250,0.2)",borderRadius:"9px",padding:"9px 11px",marginBottom:"11px"});
+  bn.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#a78bfa",marginBottom:"1px"}, "AI Call Summariser"));
+  bn.appendChild(div({fontSize:"10px",color:"#888"}, "Paste your call notes. Claude extracts pain points, objections, next steps, and updates the contact."));
+  w.appendChild(bn);
+
+  w.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.08em",fontWeight:"700",marginBottom:"5px"}, "Paste call notes"));
+  var notesInput = mkTextarea("", function(){}, {minHeight:"100px"});
+  notesInput.placeholder = "e.g. Spoke with James for 22 mins. He's currently using HubSpot but frustrated with low reply rates. Budget is $20k. Decision by end of Q1. Main concern is vendor lock-in. Wants a demo next week...";
+  w.appendChild(notesInput);
+  w.appendChild(div({height:"8px"}));
+
+  var analyseBtn = mkBtn("Analyse Call Notes", null, {padding:"9px",borderRadius:"8px",background:"linear-gradient(135deg,#a78bfa,#4a9eff)",border:"none",color:"#fff",fontSize:"12px",fontWeight:"700",width:"100%"});
+  analyseBtn.addEventListener("click", function() {
+    var notes = notesInput.value.trim();
+    if (!notes) return;
+    analyseBtn.textContent = "Analysing..."; analyseBtn.disabled = true;
+    callAI(
+      "You are a sales intelligence assistant. Analyse call notes and extract structured data. Return ONLY JSON with these exact fields: {\"summary\":\"2-3 sentence summary\",\"painPoints\":[\"...\"],\"objections\":[\"...\"],\"nextAction\":\"single most important next step\",\"budget\":\"budget info or empty string\",\"timeline\":\"timeline info or empty string\",\"sentiment\":\"positive or neutral or negative\",\"suggestedScore\":0}. suggestedScore 0-3 where 3=urgent/hot prospect.",
+      "Contact: " + c.name + ", " + c.title + " at " + c.company + "\nStage: " + c.stage + "\nCall notes:\n" + notes,
+      600
+    ).then(function(txt) {
+      var parsed = JSON.parse(txt);
+      // Build results UI
+      var result = div({background:"#13131a",border:"1px solid rgba(167,139,250,0.25)",borderRadius:"10px",overflow:"hidden",marginTop:"10px"});
+      var rh = div({padding:"8px 11px",borderBottom:"1px solid #1e1e2a",display:"flex",alignItems:"center",justifyContent:"space-between"});
+      rh.appendChild(div({fontSize:"9px",fontWeight:"700",color:"#a78bfa",textTransform:"uppercase",letterSpacing:"0.07em"}, "Call Analysis"));
+      var sentColor = parsed.sentiment==="positive"?"#34d399":parsed.sentiment==="negative"?"#f87171":"#f5a623";
+      var sentBadge = div({fontSize:"9px",padding:"1px 7px",borderRadius:"100px",fontWeight:"700"}, parsed.sentiment||"neutral");
+      sentBadge.style.color = sentColor; sentBadge.style.background = sentColor+"18";
+      rh.appendChild(sentBadge); result.appendChild(rh);
+
+      var body = div({padding:"10px 11px"});
+      // Summary
+      body.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.07em",fontWeight:"700",marginBottom:"4px"}, "Summary"));
+      body.appendChild(div({fontSize:"11px",color:"#ccc",lineHeight:"1.6",marginBottom:"10px"}, parsed.summary||""));
+
+      // Pain points
+      if (parsed.painPoints && parsed.painPoints.length) {
+        body.appendChild(div({fontSize:"9px",color:"#f87171",textTransform:"uppercase",letterSpacing:"0.07em",fontWeight:"700",marginBottom:"4px"}, "Pain Points"));
+        parsed.painPoints.forEach(function(p) {
+          var row2 = div({display:"flex",gap:"7px",marginBottom:"3px",alignItems:"flex-start"});
+          row2.appendChild(div({width:"4px",height:"4px",borderRadius:"50%",background:"#f87171",flexShrink:"0",marginTop:"5px"}));
+          row2.appendChild(div({fontSize:"11px",color:"#aaa",lineHeight:"1.5"}, p));
+          body.appendChild(row2);
+        });
+        body.appendChild(div({height:"8px"}));
+      }
+
+      // Objections
+      if (parsed.objections && parsed.objections.length) {
+        body.appendChild(div({fontSize:"9px",color:"#f5a623",textTransform:"uppercase",letterSpacing:"0.07em",fontWeight:"700",marginBottom:"4px"}, "Objections"));
+        parsed.objections.forEach(function(o) {
+          var row2 = div({display:"flex",gap:"7px",marginBottom:"3px",alignItems:"flex-start"});
+          row2.appendChild(div({width:"4px",height:"4px",borderRadius:"50%",background:"#f5a623",flexShrink:"0",marginTop:"5px"}));
+          row2.appendChild(div({fontSize:"11px",color:"#aaa",lineHeight:"1.5"}, o));
+          body.appendChild(row2);
+        });
+        body.appendChild(div({height:"8px"}));
+      }
+
+      // Budget + Timeline
+      if (parsed.budget || parsed.timeline) {
+        var btRow = div({display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"10px"});
+        if (parsed.budget) {
+          var bb = div({background:"#0e0f14",borderRadius:"7px",padding:"8px 10px"});
+          bb.appendChild(div({fontSize:"9px",color:"#34d399",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:"3px"}, "Budget"));
+          bb.appendChild(div({fontSize:"11px",color:"#ccc"}, parsed.budget));
+          btRow.appendChild(bb);
+        }
+        if (parsed.timeline) {
+          var tb2 = div({background:"#0e0f14",borderRadius:"7px",padding:"8px 10px"});
+          tb2.appendChild(div({fontSize:"9px",color:"#4a9eff",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:"3px"}, "Timeline"));
+          tb2.appendChild(div({fontSize:"11px",color:"#ccc"}, parsed.timeline));
+          btRow.appendChild(tb2);
+        }
+        body.appendChild(btRow);
+      }
+
+      // Next action
+      if (parsed.nextAction) {
+        var na = div({background:"rgba(74,158,255,0.06)",border:"1px solid rgba(74,158,255,0.2)",borderRadius:"7px",padding:"8px 10px",marginBottom:"10px"});
+        na.appendChild(div({fontSize:"9px",color:"#4a9eff",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:"3px"}, "Recommended Next Action"));
+        na.appendChild(div({fontSize:"11px",color:"#ccc",fontWeight:"600"}, parsed.nextAction));
+        body.appendChild(na);
+      }
+
+      result.appendChild(body);
+
+      // Apply to contact button
+      var applyRow = div({padding:"8px 11px",borderTop:"1px solid #1e1e2a",display:"flex",gap:"6px"});
+      var applyBtn = mkBtn("Apply to Contact", function() {
+        var updates = {
+          calls: (c.calls||[]).concat([{id:"l_"+Date.now(), date:today(), duration:"", notes:notes, sentiment:parsed.sentiment||"neutral", nextAction:parsed.nextAction||""}]),
+          nextStep: parsed.nextAction || c.nextStep,
+          lastContact: today()
+        };
+        // Add new objections detected
+        if (parsed.objections && parsed.objections.length) {
+          var existingObjs = c.objections || [];
+          var existingTexts = existingObjs.map(function(o){ return o.text.toLowerCase(); });
+          var newObjs = parsed.objections.filter(function(o){ return !existingTexts.includes(o.toLowerCase()); }).map(function(o){ return {id:"o_"+Date.now()+"_"+Math.random(), text:o, resolved:false}; });
+          if (newObjs.length) updates.objections = existingObjs.concat(newObjs);
+        }
+        // Suggested score
+        if (parsed.suggestedScore !== undefined) updates.score = Math.min(3, Math.max(0, parseInt(parsed.suggestedScore)||0));
+        updateContact(c.id, updates);
+        applyBtn.textContent = "Applied!"; applyBtn.disabled = true;
+        G.tab = "calls";
+        setTimeout(function(){ render(); }, 500);
+      }, {padding:"7px",borderRadius:"7px",background:"linear-gradient(135deg,#4a9eff,#a78bfa)",border:"none",color:"#fff",fontSize:"11px",fontWeight:"700",flex:"1"});
+      applyRow.appendChild(applyBtn);
+      result.appendChild(applyRow);
+      w.appendChild(result);
+      analyseBtn.textContent = "Analyse Call Notes"; analyseBtn.disabled = false;
+    }).catch(function() { analyseBtn.textContent = "Analyse Call Notes"; analyseBtn.disabled = false; });
+  });
+  w.appendChild(analyseBtn);
+  return w;
+}
+
+
+// ================================================================
+// FORECAST VIEW
+// ================================================================
+function renderForecast() {
+  var w = div({maxWidth:"680px"});
+  var today2 = today();
+  var fc = getForecastSummary();
+  var q = G.quota;
+
+  // Header
+  var hdr = div({marginBottom:"14px"});
+  hdr.appendChild(div({fontSize:"19px",fontWeight:"700"}, "Forecast"));
+  hdr.appendChild(div({fontSize:"12px",color:"#888",marginTop:"3px"}, "Mark deals as Commit, Upside, or Pipeline to build your number."));
+  w.appendChild(hdr);
+
+  // Forecast summary cards
+  var grid = div({display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:"8px",marginBottom:"16px"});
+  FORECAST_CATS.forEach(function(cat) {
+    var col = FORECAST_COLORS[cat];
+    var box = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"12px 13px"});
+    box.appendChild(div({fontSize:"9px",fontWeight:"700",color:col,textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"5px"}, cat));
+    box.appendChild(div({fontSize:"18px",fontWeight:"700",color:col}, "$"+(fc[cat]/1000).toFixed(1)+"k"));
+    var n = G.contacts.filter(function(c){ return !["Closed Won","Closed Lost"].includes(c.stage) && (c.forecastCat||"Pipeline")===cat; }).length;
+    box.appendChild(div({fontSize:"9px",color:"#555",marginTop:"2px"}, n+" deal"+(n!==1?"s":"")));
+    grid.appendChild(box);
+  });
+  w.appendChild(grid);
+
+  // Best case / commit vs target
+  var commit = fc.Commit || 0;
+  var bestCase = (fc.Commit||0) + (fc.Upside||0);
+  var target = q.monthlyTarget || 10000;
+  var summBox = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"13px 14px",marginBottom:"14px"});
+  summBox.appendChild(sectionTitle("vs Monthly Target"));
+  [[" Commit","$"+(commit/1000).toFixed(1)+"k",commit>=target?"#34d399":"#f87171","Deals marked Commit"],["Best Case","$"+(bestCase/1000).toFixed(1)+"k",bestCase>=target?"#34d399":bestCase>=target*.7?"#f5a623":"#f87171","Commit + Upside"],["Target","$"+(target/1000).toFixed(1)+"k","#888","Monthly revenue goal"]].forEach(function(a) {
+    var r2 = div({display:"flex",alignItems:"center",justifyContent:"space-between",padding:"7px 0",borderBottom:"1px solid #0f0f16"});
+    r2.appendChild(div({fontSize:"12px",color:"#aaa"}, a[0]));
+    var right = div({display:"flex",alignItems:"center",gap:"8px"});
+    right.appendChild(div({fontSize:"13px",fontWeight:"700",color:a[2]}, a[1]));
+    right.appendChild(div({fontSize:"9px",color:"#555"}, a[3]));
+    r2.appendChild(right);
+    summBox.appendChild(r2);
+  });
+  w.appendChild(summBox);
+
+  // Deal list by category
+  FORECAST_CATS.forEach(function(cat) {
+    var deals = G.contacts.filter(function(c){ return !["Closed Won","Closed Lost"].includes(c.stage) && (c.forecastCat||"Pipeline")===cat; });
+    if (!deals.length) return;
+    var col = FORECAST_COLORS[cat];
+    w.appendChild(div({fontSize:"9px",fontWeight:"700",color:col,textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:"7px",marginTop:"10px"}, cat+" - "+deals.length+" deals"));
+    deals.sort(function(a,b){ return (parseFloat(b.value)||0)-(parseFloat(a.value)||0); }).forEach(function(c) {
+      var sc = COLORS[c.stage];
+      var r2 = div({display:"flex",alignItems:"center",gap:"10px",background:"#0e0f14",border:"1px solid #1a1a24",borderLeft:"3px solid "+col,borderRadius:"9px",padding:"10px 13px",marginBottom:"5px",cursor:"pointer"});
+      r2.className = "row-btn";
+      r2.addEventListener("click", (function(cId){ return function(){ G.selId=cId; G.tab="bant"; render(); }; })(c.id));
+      r2.appendChild(avatar(c.name, sc, 32));
+      var info = div({flex:"1",minWidth:"0"});
+      info.appendChild(div({fontSize:"12px",fontWeight:"700",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}, c.name));
+      var meta = div({display:"flex",gap:"6px",marginTop:"2px",alignItems:"center",flexWrap:"wrap"});
+      meta.appendChild(div({fontSize:"9px",color:sc.d,background:sc.bg,border:"1px solid "+sc.b,padding:"1px 6px",borderRadius:"100px"}, c.stage));
+      var bs2 = bantScore(c);
+      meta.appendChild(div({fontSize:"9px",color:bs2>=3?"#34d399":bs2>=2?"#f5a623":"#f87171"}, "BANT "+bs2+"/4"));
+      var dis2 = daysInStage(c);
+      if (dis2!==null&&dis2>=14) meta.appendChild(div({fontSize:"9px",color:"#f87171"}, "Stalled "+dis2+"d"));
+      info.appendChild(meta);
+      r2.appendChild(info);
+      var valDiv = div({textAlign:"right",flexShrink:"0"});
+      valDiv.appendChild(div({fontSize:"13px",fontWeight:"700",color:"#34d399"}, fmtVal(c.value)));
+      // Forecast category changer
+      var catSel = mkSelect(cat, FORECAST_CATS, (function(cId){ return function(v){ updateContact(cId,{forecastCat:v}); }; })(c.id), {fontSize:"9px",padding:"2px 6px",borderRadius:"5px",border:"1px solid "+col+"44",color:col,background:col+"15",width:"auto",marginTop:"4px"});
+      valDiv.appendChild(catSel);
+      r2.appendChild(valDiv);
+      w.appendChild(r2);
+    });
+  });
+  return w;
+}
+
+// ================================================================
+// TEMPLATES VIEW
+// ================================================================
+function renderTemplates() {
+  var w = div({maxWidth:"640px"});
+  var templates = getTemplates();
+
+  var hdr = div({marginBottom:"14px"});
+  hdr.appendChild(div({fontSize:"19px",fontWeight:"700"}, "Email Templates"));
+  hdr.appendChild(div({fontSize:"12px",color:"#888",marginTop:"3px"}, "Save your best emails. Reuse them across contacts."));
+  w.appendChild(hdr);
+
+  // Add template button
+  var addBtn2 = mkBtn("+ New Template", function(){ G.modal="addTemplate"; renderModal(); }, {padding:"8px 14px",borderRadius:"8px",background:"linear-gradient(135deg,#4a9eff,#a78bfa)",border:"none",color:"#fff",fontSize:"11px",fontWeight:"700",marginBottom:"14px"});
+  w.appendChild(addBtn2);
+
+  if (!templates.length) {
+    var empty = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"32px",textAlign:"center"});
+    empty.appendChild(div({fontSize:"14px",fontWeight:"600",color:"#888",marginBottom:"5px"}, "No templates yet"));
+    empty.appendChild(div({fontSize:"11px",color:"#555"}, "Save emails from the AI Email Generator or create them here."));
+    w.appendChild(empty);
+    return w;
+  }
+
+  // Group by type
+  var groups = {};
+  templates.forEach(function(t){ groups[t.type] = (groups[t.type]||[]); groups[t.type].push(t); });
+  Object.keys(groups).forEach(function(type) {
+    w.appendChild(div({fontSize:"9px",fontWeight:"700",color:"#888",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:"7px",marginTop:"10px"}, type.replace(/-/g," ")));
+    groups[type].forEach(function(tmpl) {
+      var card = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"12px 14px",marginBottom:"6px"});
+      var cardHead = div({display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:"10px",marginBottom:"8px"});
+      var cardInfo = div({flex:"1",minWidth:"0"});
+      cardInfo.appendChild(div({fontSize:"12px",fontWeight:"700",marginBottom:"2px"}, tmpl.name));
+      cardInfo.appendChild(div({fontSize:"10px",color:"#666",fontStyle:"italic"}, "Subject: "+tmpl.subject));
+      cardHead.appendChild(cardInfo);
+      var cardBtns = div({display:"flex",gap:"4px",flexShrink:"0"});
+      var copyBtn = mkBtn("Copy", function(){
+        navigator.clipboard.writeText("Subject: "+tmpl.subject+"\n\n"+tmpl.body);
+        copyBtn.textContent="Copied!"; setTimeout(function(){copyBtn.textContent="Copy";},2000);
+      }, {padding:"3px 8px",borderRadius:"5px",background:"#13131a",border:"1px solid #1e1e2a",color:"#aaa",fontSize:"9px",fontWeight:"600"});
+      var delBtn = mkBtn("Del", function(){
+        var t2 = getTemplates().filter(function(x){ return x.id!==tmpl.id; });
+        saveTemplates(t2); render();
+      }, {padding:"3px 8px",borderRadius:"5px",background:"rgba(248,113,113,0.08)",border:"1px solid rgba(248,113,113,0.2)",color:"#f87171",fontSize:"9px",fontWeight:"600"});
+      cardBtns.appendChild(copyBtn); cardBtns.appendChild(delBtn);
+      cardHead.appendChild(cardBtns);
+      card.appendChild(cardHead);
+      var preview = div({fontSize:"10px",color:"#666",lineHeight:"1.6",whiteSpace:"pre-wrap",maxHeight:"60px",overflow:"hidden"}, tmpl.body.slice(0,180)+(tmpl.body.length>180?"...":""));
+      card.appendChild(preview);
+      if (tmpl.tags && tmpl.tags.length) {
+        var tagRow = div({display:"flex",gap:"4px",marginTop:"7px",flexWrap:"wrap"});
+        tmpl.tags.forEach(function(tag){ tagRow.appendChild(div({fontSize:"8px",color:"#4a9eff",background:"rgba(74,158,255,0.08)",padding:"1px 6px",borderRadius:"100px"}, tag)); });
+        card.appendChild(tagRow);
+      }
+      w.appendChild(card);
+    });
+  });
+  return w;
+}
+
+// ================================================================
+// AI COACH TAB
+// ================================================================
+function renderCoachTab(c) {
+  var w = div({});
+  var bn = div({background:"linear-gradient(135deg,rgba(52,211,153,0.08),rgba(167,139,250,0.06))",border:"1px solid rgba(52,211,153,0.2)",borderRadius:"9px",padding:"9px 11px",marginBottom:"11px"});
+  bn.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#34d399",marginBottom:"1px"}, "AI Deal Coach"));
+  bn.appendChild(div({fontSize:"10px",color:"#888"}, "Get a specific next-best action based on this deal's full context."));
+  w.appendChild(bn);
+
+  // Deal snapshot
+  var snap = div({background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"9px",padding:"10px 12px",marginBottom:"11px"});
+  snap.appendChild(div({fontSize:"9px",fontWeight:"700",color:"#888",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"8px"}, "Deal Snapshot"));
+  var snapGrid = div({display:"grid",gridTemplateColumns:"1fr 1fr",gap:"5px"});
+  var dis3 = daysInStage(c);
+  var dh3 = dealHealth(c);
+  var bs3 = bantScore(c);
+  var icp3 = icpScore(c);
+  [[" Stage",c.stage],["Days in Stage",dis3!==null?dis3+"d":"Unknown"],["BANT Score",bs3+"/4"],["Deal Health",dh3!==null?dh3+"%":"N/A"],["Lead Score",SCORE_LABEL[c.score||0]],["ICP Fit",icp3+"%"],["Last Contact",c.lastContact?"Last "+daysAgo(c.lastContact)+"d ago":"Never"],["Deal Value",fmtVal(c.value)]].forEach(function(pair) {
+    var item = div({});
+    item.appendChild(div({fontSize:"8px",color:"#555",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:"1px"}, pair[0]));
+    item.appendChild(div({fontSize:"11px",fontWeight:"600"}, String(pair[1]||"-")));
+    snapGrid.appendChild(item);
+  });
+  snap.appendChild(snapGrid);
+  w.appendChild(snap);
+
+  var coachBtn = mkBtn("Get Next Best Action", null, {padding:"9px",borderRadius:"8px",background:"linear-gradient(135deg,#34d399,#4a9eff)",border:"none",color:"#fff",fontSize:"12px",fontWeight:"700",width:"100%"});
+  coachBtn.addEventListener("click", function(){
+    coachBtn.textContent = "Analysing deal..."; coachBtn.disabled = true;
+    var callHistory = (c.calls||[]).slice(-2).map(function(l){ return l.date+": "+l.notes+" ("+l.sentiment+")"; }).join(" | ");
+    var emailHistory = "Outbound: "+(c.emails||[]).filter(function(e){return e.direction==="out";}).length+", Inbound replies: "+(c.emails||[]).filter(function(e){return e.direction==="in";}).length;
+    var dis4 = daysInStage(c); var dh4 = dealHealth(c);
+    callAI(
+      "You are an elite B2B sales coach. Analyse this deal and provide ONE specific, actionable next step. Return ONLY JSON: {\"action\":\"specific action to take\",\"reasoning\":\"why this is the right move\",\"emailSubject\":\"suggested email subject if email is recommended else empty string\",\"urgency\":\"high or medium or low\",\"risk\":\"main deal risk in one sentence\"}",
+      "Contact: "+c.name+", "+c.title+" at "+c.company+"\nStage: "+c.stage+"\nDays in stage: "+(dis4||"unknown")+"\nDeal value: "+fmtVal(c.value)+"\nBANT score: "+bantScore(c)+"/4 (Budget:"+c.bantBudget+", Authority:"+c.bantAuthority+", Need:"+c.bantNeed+", Timeline:"+c.bantTimeline+")\nDeal health: "+(dh4||"N/A")+"%\nLast contact: "+c.lastContact+" ("+(c.lastContact?daysAgo(c.lastContact)+"d ago":"never")+")\nNext step set: "+(c.nextStep||"none")+"\nCall history: "+(callHistory||"no calls")+"\nEmail history: "+emailHistory+"\nObjections: "+((c.objections||[]).map(function(o){return o.text;}).join(", ")||"none")+"\nNotes: "+(c.notes||"none"),
+      500
+    ).then(function(txt){
+      var res = JSON.parse(txt);
+      var resultBox = div({background:"#13131a",border:"1px solid rgba(52,211,153,0.25)",borderRadius:"10px",overflow:"hidden",marginTop:"10px"});
+      var rh = div({padding:"8px 11px",borderBottom:"1px solid #1e1e2a",display:"flex",alignItems:"center",justifyContent:"space-between"});
+      rh.appendChild(div({fontSize:"9px",fontWeight:"700",color:"#34d399",textTransform:"uppercase",letterSpacing:"0.07em"}, "Recommended Action"));
+      var urgColor = res.urgency==="high"?"#f87171":res.urgency==="medium"?"#f5a623":"#4a9eff";
+      var urgBadge = div({fontSize:"9px",fontWeight:"700",padding:"1px 7px",borderRadius:"100px",color:urgColor,background:urgColor+"18"}, (res.urgency||"medium").toUpperCase());
+      rh.appendChild(urgBadge); resultBox.appendChild(rh);
+      var body2 = div({padding:"10px 11px"});
+      // Main action
+      var actionBox = div({background:"rgba(52,211,153,0.06)",border:"1px solid rgba(52,211,153,0.2)",borderRadius:"8px",padding:"9px 11px",marginBottom:"9px"});
+      actionBox.appendChild(div({fontSize:"12px",fontWeight:"700",color:"#34d399",lineHeight:"1.5"}, res.action||"No action generated"));
+      body2.appendChild(actionBox);
+      // Reasoning
+      if (res.reasoning) {
+        body2.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.07em",fontWeight:"700",marginBottom:"3px"}, "Why"));
+        body2.appendChild(div({fontSize:"11px",color:"#aaa",lineHeight:"1.6",marginBottom:"9px"}, res.reasoning));
+      }
+      // Risk
+      if (res.risk) {
+        var riskBox = div({display:"flex",gap:"7px",alignItems:"flex-start",background:"rgba(248,113,113,0.06)",border:"1px solid rgba(248,113,113,0.15)",borderRadius:"7px",padding:"7px 10px",marginBottom:"9px"});
+        riskBox.appendChild(div({fontSize:"10px",color:"#f87171",fontWeight:"700",flexShrink:"0"}, "Risk:"));
+        riskBox.appendChild(div({fontSize:"10px",color:"#aaa",lineHeight:"1.5"}, res.risk));
+        body2.appendChild(riskBox);
+      }
+      resultBox.appendChild(body2);
+      // Actions row
+      var actRow = div({padding:"8px 11px",borderTop:"1px solid #1e1e2a",display:"flex",gap:"5px"});
+      var applyBtn2 = mkBtn("Set as Next Step", function(){
+        updateContact(c.id, {nextStep: res.action});
+        applyBtn2.textContent = "Set!"; applyBtn2.disabled = true;
+        render();
+      }, {padding:"6px 10px",borderRadius:"6px",background:"rgba(52,211,153,0.1)",border:"1px solid rgba(52,211,153,0.25)",color:"#34d399",fontSize:"10px",fontWeight:"600",flex:"1"});
+      actRow.appendChild(applyBtn2);
+      if (res.emailSubject) {
+        var emailBtn = mkBtn("Open AI Email", function(){ G.tab="ai"; render(); }, {padding:"6px 10px",borderRadius:"6px",background:"rgba(167,139,250,0.1)",border:"1px solid rgba(167,139,250,0.25)",color:"#a78bfa",fontSize:"10px",fontWeight:"600"});
+        actRow.appendChild(emailBtn);
+      }
+      resultBox.appendChild(actRow);
+      w.appendChild(resultBox);
+      coachBtn.textContent = "Get Next Best Action"; coachBtn.disabled = false;
+    }).catch(function(){ coachBtn.textContent = "Get Next Best Action"; coachBtn.disabled = false; });
+  });
+  w.appendChild(coachBtn);
+  return w;
+}
+
+// ================================================================
+// COMPETITORS TAB
+// ================================================================
+function renderCompetitorsTab(c) {
+  var w = div({});
+  var COMP_LIST = ["Salesforce","HubSpot","Pipedrive","Zoho","Monday","Close CRM","Outreach","Salesloft","Apollo","Clay","Other"];
+  var bn = div({background:"linear-gradient(135deg,rgba(248,113,113,0.08),rgba(245,166,35,0.06))",border:"1px solid rgba(248,113,113,0.2)",borderRadius:"9px",padding:"9px 11px",marginBottom:"11px"});
+  bn.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#f87171",marginBottom:"1px"}, "Competitor Tracking"));
+  bn.appendChild(div({fontSize:"10px",color:"#888"}, "Track who you're up against. Patterns across deals reveal where you win and lose."));
+  w.appendChild(bn);
+
+  var competitors = c.competitors || [];
+
+  // Add competitor
+  var addRow = div({display:"flex",gap:"7px",marginBottom:"11px"});
+  var compSel = mkSelect("", [["","Select competitor..."]].concat(COMP_LIST.map(function(c2){return[c2,c2];})), function(){}, {flex:"1",width:"auto"});
+  var statusSel = mkSelect("In Evaluation", ["In Evaluation","Primary","Eliminated","Unknown"], function(){}, {width:"auto"});
+  addRow.appendChild(compSel); addRow.appendChild(statusSel);
+  addRow.appendChild(mkBtn("Add", function(){
+    var name = compSel.value; if(!name) return;
+    var status = statusSel.value;
+    updateContact(c.id, {competitors:(competitors).concat([{id:"comp_"+Date.now(),name:name,status:status,notes:""}])});
+  }, {padding:"7px 11px",borderRadius:"7px",background:"rgba(248,113,113,0.1)",border:"1px solid rgba(248,113,113,0.25)",color:"#f87171",fontSize:"11px",fontWeight:"600"}));
+  w.appendChild(addRow);
+
+  if (!competitors.length) {
+    w.appendChild(div({color:"#444",fontSize:"12px",textAlign:"center",padding:"18px"}, "No competitors tracked for this deal."));
+  } else {
+    competitors.forEach(function(comp) {
+      var box = div({background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"9px",padding:"10px 11px",marginBottom:"7px"});
+      var top2 = div({display:"flex",alignItems:"center",justifyContent:"space-between",gap:"8px",marginBottom:"6px"});
+      var nameDiv2 = div({display:"flex",alignItems:"center",gap:"8px"});
+      nameDiv2.appendChild(div({fontSize:"12px",fontWeight:"700"}, comp.name));
+      var statusColor = comp.status==="Primary"?"#f87171":comp.status==="Eliminated"?"#34d399":comp.status==="In Evaluation"?"#f5a623":"#888";
+      var statusBadge = div({fontSize:"9px",fontWeight:"700",padding:"1px 7px",borderRadius:"100px",color:statusColor,background:statusColor+"18"}, comp.status||"Unknown");
+      nameDiv2.appendChild(statusBadge); top2.appendChild(nameDiv2);
+      var delBtn2 = mkBtn("Remove", (function(compId){ return function(){
+        updateContact(c.id, {competitors:(c.competitors||[]).filter(function(x){return x.id!==compId;})});
+      }; })(comp.id), {padding:"2px 7px",borderRadius:"4px",background:"rgba(248,113,113,0.08)",border:"1px solid rgba(248,113,113,0.2)",color:"#f87171",fontSize:"9px",fontWeight:"600"});
+      top2.appendChild(delBtn2); box.appendChild(top2);
+      // Status changer
+      var statRow = div({display:"flex",gap:"5px",marginBottom:"6px"});
+      ["In Evaluation","Primary","Eliminated"].forEach(function(st) {
+        var sb2 = mkBtn(st, (function(compId2,status2){ return function(){
+          updateContact(c.id, {competitors:(c.competitors||[]).map(function(x){return x.id===compId2?Object.assign({},x,{status:status2}):x;})});
+        }; })(comp.id, st), {padding:"3px 8px",borderRadius:"5px",fontSize:"9px",fontWeight:"600",background:comp.status===st?statusColor+"18":"#0e0f14",border:"1px solid "+(comp.status===st?statusColor+"44":"#1a1a24"),color:comp.status===st?statusColor:"#666"});
+        statRow.appendChild(sb2);
+      });
+      box.appendChild(statRow);
+      // Notes
+      var notesInp = mkTextarea(comp.notes||"", function(v){
+        updateContact(c.id, {competitors:(c.competitors||[]).map(function(x){return x.id===comp.id?Object.assign({},x,{notes:v}):x;})});
+      }, {minHeight:"40px",fontSize:"10px"});
+      notesInp.placeholder = "Battle card notes, their pricing, weaknesses...";
+      box.appendChild(notesInp);
+      w.appendChild(box);
+    });
+  }
+
+  // Competitor patterns across all deals
+  var allComps = {};
+  G.contacts.forEach(function(contact){
+    (contact.competitors||[]).forEach(function(comp){
+      if (!allComps[comp.name]) allComps[comp.name] = {total:0,primary:0,won:0,lost:0};
+      allComps[comp.name].total++;
+      if (comp.status==="Primary") allComps[comp.name].primary++;
+      if (contact.stage==="Closed Won") allComps[comp.name].won++;
+      if (contact.stage==="Closed Lost") allComps[comp.name].lost++;
+    });
+  });
+  if (Object.keys(allComps).length > 1) {
+    var patternsBox = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"9px",padding:"11px 13px",marginTop:"10px"});
+    patternsBox.appendChild(sectionTitle("Competition Patterns (All Deals)", "#f87171"));
+    Object.entries(allComps).sort(function(a,b){return b[1].total-a[1].total;}).forEach(function(pair) {
+      var name2 = pair[0], data = pair[1];
+      var r2 = div({display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"6px"});
+      r2.appendChild(div({fontSize:"11px",color:"#ccc",fontWeight:"600"}, name2));
+      var stats2 = div({display:"flex",gap:"8px"});
+      stats2.appendChild(div({fontSize:"9px",color:"#888"}, data.total+" deals"));
+      if (data.won) stats2.appendChild(div({fontSize:"9px",color:"#34d399",fontWeight:"700"}, data.won+" won"));
+      if (data.lost) stats2.appendChild(div({fontSize:"9px",color:"#f87171",fontWeight:"700"}, data.lost+" lost"));
+      r2.appendChild(stats2);
+      patternsBox.appendChild(r2);
+    });
+    w.appendChild(patternsBox);
+  }
+  return w;
+}
+
+function render() {
+  renderSidebar();
+  renderMain();
+  renderDrawer();
+  renderModal();
+}
+
+init();
+</script>
+</body>
+</html>
