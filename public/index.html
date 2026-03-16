@@ -234,7 +234,11 @@ var G = {
   dragOver: null,
   quota: {emails:50,calls:20,meetings:10,monthlyTarget:15000},
   icpConfig: {industries:["SaaS","Software","Tech","AI","Fintech"], titles:["RevOps","Sales","GTM"], minDeal:5000, maxDeal:50000},
-  forecastView: false
+  forecastView: false,
+  dialerActive: false,
+  dialerIdx: 0,
+  dialerSession: null,
+  dialerCallsMade: 0
 };
 
 async function init() {
@@ -482,7 +486,7 @@ function renderSidebar() {
 
   // Nav
   var nav = div({display:"flex",flexDirection:"column",gap:"1px",padding:"9px 7px",flex:"1"});
-  var navItems = [["signal","Signal Feed"],["pipeline","Pipeline"],["forecast","Forecast"],["contacts","Contacts"],["tasks","Tasks"],["callqueue","Call Queue"],["cal","Calendar"],["stats","Performance"],["templates","Templates"]];
+  var navItems = [["signal","Signal Feed"],["pipeline","Pipeline"],["forecast","Forecast"],["contacts","Contacts"],["tasks","Tasks"],["callqueue","Call Queue"],["cal","Calendar"],["stats","Performance"],["templates","Templates"],["agents","AI Agents"]];
   navItems.forEach(function(pair) {
     var id = pair[0], label = pair[1];
     var pending = getPending();
@@ -536,6 +540,7 @@ function renderMain() {
   tl.appendChild(div({fontSize:"10px",color:"#555",marginTop:"1px"}, G.contacts.length + " contacts - " + st.pipe + " active - $" + (st.val/1000).toFixed(0) + "k won"));
   tb.appendChild(tl);
   var tr = div({display:"flex",gap:"5px"});
+  tr.appendChild(mkBtn("?", function() { G.modal="shortcuts"; renderModal(); }, {padding:"5px 7px",borderRadius:"7px",background:"#13131a",border:"1px solid #1e1e2a",color:"#555",fontSize:"11px",fontWeight:"600",title:"Keyboard shortcuts"}));
   tr.appendChild(mkBtn("Export CSV", function() { exportCSV(); }, {padding:"5px 9px",borderRadius:"7px",background:"#13131a",border:"1px solid #1e1e2a",color:"#aaa",fontSize:"11px",fontWeight:"600"}));
   tr.appendChild(mkBtn("ICP", function() { G.modal="icpConfig"; renderModal(); }, {padding:"5px 9px",borderRadius:"7px",background:"#13131a",border:"1px solid #1e1e2a",color:"#aaa",fontSize:"11px",fontWeight:"600"}));
   tr.appendChild(mkBtn("Import", function() { G.modal="import"; renderModal(); }, {padding:"5px 10px",borderRadius:"7px",background:"#13131a",border:"1px solid #1e1e2a",color:"#aaa",fontSize:"11px",fontWeight:"600"}));
@@ -544,7 +549,7 @@ function renderMain() {
 
   var content = div({flex:"1",overflowY:"auto",padding:"13px 20px 18px"});
   content.className = "anim";
-  var viewFns = {signal:renderSignal,pipeline:renderKanban,forecast:renderForecast,contacts:renderContacts,tasks:renderTasks,callqueue:renderCallQueue,cal:renderCal,stats:renderStats,templates:renderTemplates};
+  var viewFns = {signal:renderSignal,pipeline:renderKanban,forecast:renderForecast,contacts:renderContacts,tasks:renderTasks,callqueue:renderCallQueue,cal:renderCal,stats:renderStats,templates:renderTemplates,agents:renderAgents};
   if (viewFns[G.view]) content.appendChild(viewFns[G.view]());
   mn.appendChild(content);
 }
@@ -587,6 +592,19 @@ function renderSignal() {
       if (m.date >= td2 && m.date <= sd) sigs.push({p:1,col:"#34d399",c:c,txt:"Meeting: " + m.title,sub:m.date + " - " + (m.time||""),tag:"MEETING"});
     });
   });
+  // Sequence step overdue alerts
+  cx.filter(function(c){ return !["Closed Won","Closed Lost"].includes(c.stage); }).forEach(function(c) {
+    var active = (c.sequences||[]).find(function(s){ return s.active; });
+    if (!active) return;
+    var created = new Date(active.createdDate + "T00:00:00").getTime();
+    active.steps.forEach(function(step) {
+      if (step.status !== "pending") return;
+      var stepDue = created + (step.day - 1) * 86400000;
+      if (Date.now() > stepDue) {
+        sigs.push({p:2,col:"#a78bfa",c:c,txt:"Sequence: Day " + step.day + " " + (step.type==="linkedin"?"LinkedIn message":"email") + " overdue",sub:c.name + " - " + (step.subject||""),tag:"SEQUENCE"});
+      }
+    });
+  });
   sigs.sort(function(a,b) { return a.p - b.p; });
 
   var w = div({maxWidth:"640px"});
@@ -594,6 +612,21 @@ function renderSignal() {
   hdr.appendChild(div({fontSize:"10px",color:"#555",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"2px"}, new Date().toLocaleDateString("en-CA",{weekday:"long",month:"long",day:"numeric"})));
   hdr.appendChild(div({fontSize:"19px",fontWeight:"700"}, "Good morning, Tariq"));
   hdr.appendChild(div({fontSize:"12px",color:"#888",marginTop:"2px"}, sigs.filter(function(s) { return ["OVERDUE","TODAY"].includes(s.tag); }).length + " tasks need attention - " + st.hot + " hot leads"));
+  // Daily activity scorecard
+  var todayStr = today();
+  var todayEmails = G.contacts.flatMap(function(c){ return c.emails||[]; }).filter(function(e){ return e.direction==="out" && e.date===todayStr; }).length;
+  var todayCalls = G.contacts.flatMap(function(c){ return c.calls||[]; }).filter(function(l){ return l.date===todayStr; }).length;
+  var todayMeetings = G.contacts.flatMap(function(c){ return c.meetings||[]; }).filter(function(m){ return m.date===todayStr; }).length;
+  var dayTarget = {emails: Math.ceil(q.emails/5), calls: Math.ceil(q.calls/5), meetings: Math.ceil(q.meetings/5)};
+  var dayCard = div({display:"flex",gap:"8px",marginTop:"10px"});
+  [["Emails Today",todayEmails,dayTarget.emails,"#4a9eff"],["Calls Today",todayCalls,dayTarget.calls,"#a78bfa"],["Meetings Today",todayMeetings,dayTarget.meetings,"#34d399"]].forEach(function(a) {
+    var done = a[1] >= a[2];
+    var box = div({background:"#0e0f14",border:"1px solid "+(done?"#34d39933":"#1a1a24"),borderRadius:"8px",padding:"8px 10px",flex:"1",textAlign:"center"});
+    box.appendChild(div({fontSize:"15px",fontWeight:"700",color:done?"#34d399":a[3]}, a[1] + "/" + a[2]));
+    box.appendChild(div({fontSize:"8px",color:"#555",textTransform:"uppercase",letterSpacing:"0.06em",marginTop:"1px"}, a[0]));
+    dayCard.appendChild(box);
+  });
+  hdr.appendChild(dayCard);
   w.appendChild(hdr);
 
   var kpi = div({display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"6px",marginBottom:"8px"});
@@ -967,6 +1000,12 @@ function renderDrawer() {
       G.modal = "closeReason";
       renderModal();
     } else {
+      // Stage gate: warn if advancing to gated stages with low BANT
+      var gatedStages = ["Meeting Set","Proposal Sent"];
+      var advancing = STAGES.indexOf(v) > STAGES.indexOf(c.stage);
+      if (advancing && gatedStages.includes(v) && bantScore(c) < 2) {
+        if (!confirm("Low qualification warning\n\nBANT score: " + bantScore(c) + "/4\n\nBudget and Authority are not confirmed. Advancing to \"" + v + "\" with unqualified deals risks polluting your pipeline.\n\nContinue anyway?")) return;
+      }
       updateContact(c.id, {stage:v});
     }
   }, {fontSize:"10px",fontWeight:"600",padding:"2px 7px",borderRadius:"5px",border:"1px solid "+sc.b,color:sc.d,background:sc.bg,width:"auto"}));
@@ -1623,6 +1662,23 @@ function renderModal() {
       }
       G.modal = null; render();
     }));
+  } else if (G.modal === "shortcuts") {
+    pn.appendChild(mHead("Keyboard Shortcuts"));
+    var shortcutGroups = [
+      {label:"Global",items:[["?","Show this help"],["N","Add new contact"],["Esc","Close drawer / modal"]]},
+      {label:"With contact open",items:[["E","Open AI Email tab"],["C","Log a call"],["T","Add a task"],["M","Add a meeting"],["Esc","Close contact"]]}
+    ];
+    shortcutGroups.forEach(function(grp){
+      pn.appendChild(div({fontSize:"9px",color:"#4a9eff",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.07em",marginTop:"10px",marginBottom:"6px"}, grp.label));
+      grp.items.forEach(function(pair){
+        var row = div({display:"flex",alignItems:"center",justifyContent:"space-between",padding:"5px 0",borderBottom:"1px solid #0f0f16"});
+        var kbd = div({background:"#13131a",border:"1px solid #2a2a3a",borderRadius:"5px",padding:"2px 8px",fontSize:"11px",fontWeight:"700",color:"#e8e8f0",fontFamily:"monospace"}, pair[0]);
+        row.appendChild(kbd);
+        row.appendChild(div({fontSize:"11px",color:"#888"}, pair[1]));
+        pn.appendChild(row);
+      });
+    });
+
   } else if (G.modal === "setTarget") {
     var fd = {monthlyTarget: G.quota.monthlyTarget || 10000};
     pn.appendChild(mHead("Set Monthly Revenue Target"));
@@ -1746,15 +1802,11 @@ function renderBANTTab(c) {
 }
 
 // ================================================================
-// CALL QUEUE VIEW
+// CALL QUEUE VIEW (with Power Dialer)
 // ================================================================
-function renderCallQueue() {
-  var td2 = today();
-  // Priority queue: hot/urgent contacts not recently contacted, sorted by score desc then days since contact
-  var queue = G.contacts
-    .filter(function(c) {
-      return !["Closed Won","Closed Lost"].includes(c.stage);
-    })
+function buildCallQueue() {
+  return G.contacts
+    .filter(function(c) { return !["Closed Won","Closed Lost"].includes(c.stage); })
     .map(function(c) {
       var d = daysAgo(c.lastContact);
       var priority = 0;
@@ -1771,11 +1823,135 @@ function renderCallQueue() {
       var db = b._d === null ? 9999 : b._d;
       return db - da;
     });
+}
 
+function renderCallQueue() {
+  var queue = buildCallQueue();
   var w = div({maxWidth:"640px"});
+
+  // ── POWER DIALER MODE ──
+  if (G.dialerActive && G.dialerSession) {
+    var sessionIds = G.dialerSession;
+    var idx = G.dialerIdx;
+    if (idx >= sessionIds.length) {
+      // Session complete
+      var done = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"12px",padding:"32px",textAlign:"center"});
+      done.appendChild(div({fontSize:"22px",marginBottom:"6px"}, "Session Complete"));
+      done.appendChild(div({fontSize:"13px",color:"#888",marginBottom:"12px"}, G.dialerCallsMade + " calls logged this session"));
+      done.appendChild(mkBtn("Back to Queue", function(){ G.dialerActive=false; G.dialerSession=null; G.dialerIdx=0; G.dialerCallsMade=0; render(); }, {padding:"9px 18px",borderRadius:"8px",background:"linear-gradient(135deg,#4a9eff,#a78bfa)",border:"none",color:"#fff",fontSize:"12px",fontWeight:"700"}));
+      w.appendChild(done);
+      return w;
+    }
+    var currentId = sessionIds[idx];
+    var c = G.contacts.find(function(x){ return x.id === currentId; });
+    if (!c) { G.dialerIdx++; render(); return w; }
+    var sc = COLORS[c.stage];
+    // Session header
+    var sesHdr = div({display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"12px"});
+    sesHdr.appendChild(div({fontSize:"13px",fontWeight:"700",color:"#a78bfa"}, "Power Dialer  " + (idx+1) + " / " + sessionIds.length));
+    var sesRight = div({display:"flex",gap:"6px",alignItems:"center"});
+    sesRight.appendChild(div({fontSize:"10px",color:"#34d399"}, G.dialerCallsMade + " logged"));
+    sesRight.appendChild(mkBtn("End Session", function(){ G.dialerActive=false; G.dialerSession=null; G.dialerIdx=0; G.dialerCallsMade=0; render(); }, {padding:"5px 10px",borderRadius:"6px",background:"rgba(248,113,113,0.1)",border:"1px solid rgba(248,113,113,0.2)",color:"#f87171",fontSize:"10px",fontWeight:"600"}));
+    sesHdr.appendChild(sesRight);
+    w.appendChild(sesHdr);
+    // Progress bar
+    var prog = div({height:"3px",background:"#1e1e2a",borderRadius:"2px",marginBottom:"14px"});
+    prog.appendChild(div({height:"100%",width:Math.round(idx/sessionIds.length*100)+"%",background:"linear-gradient(90deg,#4a9eff,#a78bfa)",borderRadius:"2px"}));
+    w.appendChild(prog);
+    // Contact card
+    var card = div({background:"#0e0f14",border:"1px solid #1a1a24",borderLeft:"4px solid #a78bfa",borderRadius:"12px",padding:"16px",marginBottom:"12px"});
+    var cardTop = div({display:"flex",alignItems:"center",gap:"12px",marginBottom:"10px"});
+    cardTop.appendChild(avatar(c.name, sc, 44));
+    var ci = div({});
+    ci.appendChild(div({fontSize:"16px",fontWeight:"700"}, c.name));
+    ci.appendChild(div({fontSize:"11px",color:"#888",marginTop:"2px"}, c.title + " at " + c.company));
+    var badges = div({display:"flex",gap:"5px",marginTop:"5px",flexWrap:"wrap"});
+    var sb = div({fontSize:"8px",fontWeight:"700",padding:"2px 7px",borderRadius:"100px",color:SCORE_COLOR[c.score||0],background:SCORE_COLOR[c.score||0]+"18"}, SCORE_LABEL[c.score||0]);
+    badges.appendChild(sb);
+    var icp4 = icpScore(c);
+    badges.appendChild(div({fontSize:"8px",fontWeight:"700",padding:"2px 7px",borderRadius:"100px",color:icpColor(icp4),background:icpColor(icp4)+"18"}, "ICP " + icp4 + "%"));
+    var d4 = daysAgo(c.lastContact);
+    if (d4 !== null) badges.appendChild(div({fontSize:"8px",padding:"2px 7px",borderRadius:"100px",color:d4>=7?"#f87171":"#888",background:d4>=7?"#f8717118":"#1e1e2a"}, d4 + "d ago"));
+    ci.appendChild(badges); cardTop.appendChild(ci); card.appendChild(cardTop);
+    if (c.nextStep) {
+      var nsRow = div({fontSize:"10px",color:"#4a9eff",background:"rgba(74,158,255,0.06)",border:"1px solid rgba(74,158,255,0.15)",borderRadius:"6px",padding:"6px 9px",marginBottom:"10px"}, "-> " + c.nextStep);
+      card.appendChild(nsRow);
+    }
+    // Voicemail script (collapsible)
+    var vmScript = "Hi " + c.name.split(" ")[0] + ", this is [Your Name] calling about [value prop] for " + c.company + ". I'll send you a quick email but if you want to connect, you can reach me at [phone]. Have a great day.";
+    var vmBox = div({background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"8px",padding:"8px 10px",marginBottom:"10px"});
+    var vmHead = div({display:"flex",justifyContent:"space-between",alignItems:"center"});
+    vmHead.appendChild(div({fontSize:"9px",fontWeight:"700",color:"#888",textTransform:"uppercase",letterSpacing:"0.07em"}, "Voicemail Script"));
+    var cpVm = mkBtn("Copy", function(){ navigator.clipboard.writeText(vmScript); cpVm.textContent="Copied!"; setTimeout(function(){ cpVm.textContent="Copy"; },1500); }, {padding:"2px 7px",borderRadius:"4px",background:"#1e1e2a",border:"1px solid #2a2a3a",color:"#aaa",fontSize:"9px",fontWeight:"600"});
+    vmHead.appendChild(cpVm); vmBox.appendChild(vmHead);
+    vmBox.appendChild(div({fontSize:"10px",color:"#888",lineHeight:"1.6",marginTop:"5px",fontStyle:"italic"}, vmScript));
+    card.appendChild(vmBox);
+    // Quick log form
+    var logState = {outcome:"Connected",notes:"",nextAction:"",duration:""};
+    var logForm = div({});
+    var outcomeRow = div({display:"flex",gap:"4px",marginBottom:"8px"});
+    var outcomeBtns = {};
+    ["Connected","Voicemail","No Answer"].forEach(function(o) {
+      var ob = mkBtn(o, function(){
+        logState.outcome = o;
+        Object.keys(outcomeBtns).forEach(function(k){ outcomeBtns[k].style.background="#13131a"; outcomeBtns[k].style.color="#888"; outcomeBtns[k].style.border="1px solid #1e1e2a"; });
+        ob.style.background = "rgba(167,139,250,0.1)"; ob.style.color="#a78bfa"; ob.style.border="1px solid rgba(167,139,250,0.3)";
+      }, {padding:"5px 10px",borderRadius:"6px",background:logState.outcome===o?"rgba(167,139,250,0.1)":"#13131a",border:"1px solid "+(logState.outcome===o?"rgba(167,139,250,0.3)":"#1e1e2a"),color:logState.outcome===o?"#a78bfa":"#888",fontSize:"10px",fontWeight:"600",flex:"1"});
+      outcomeBtns[o] = ob; outcomeRow.appendChild(ob);
+    });
+    logForm.appendChild(outcomeRow);
+    var notesRow = div({display:"flex",gap:"6px",marginBottom:"8px"});
+    var notesInp2 = mkTextarea("", function(v){ logState.notes=v; }, {minHeight:"50px",flex:"1"});
+    notesInp2.placeholder = "Call notes (optional)...";
+    logForm.appendChild(notesInp2);
+    var naInp = mkInput("", function(v){ logState.nextAction=v; }, {marginBottom:"8px"});
+    naInp.placeholder = "Next action...";
+    logForm.appendChild(naInp);
+    card.appendChild(logForm);
+    // Action buttons
+    var actRow2 = div({display:"flex",gap:"6px"});
+    var logNextBtn = mkBtn("Log & Next", function(){
+      var callEntry = {id:"l_"+Date.now(), date:today(), duration:"", notes:logState.outcome + (logState.notes ? ": " + logState.notes : ""), sentiment:logState.outcome==="Connected"?"neutral":"negative", nextAction:logState.nextAction};
+      var patch = {calls:(c.calls||[]).concat([callEntry]), lastContact:today()};
+      if (logState.nextAction) patch.nextStep = logState.nextAction;
+      updateContact(c.id, patch);
+      G.dialerCallsMade++;
+      G.dialerIdx++;
+      render();
+    }, {padding:"9px",borderRadius:"8px",background:"linear-gradient(135deg,#4a9eff,#a78bfa)",border:"none",color:"#fff",fontSize:"12px",fontWeight:"700",flex:"2"});
+    var skipBtn = mkBtn("Skip", function(){ G.dialerIdx++; render(); }, {padding:"9px 14px",borderRadius:"8px",background:"#13131a",border:"1px solid #1e1e2a",color:"#aaa",fontSize:"12px",fontWeight:"600"});
+    var viewBtn = mkBtn("View Contact", function(){ G.selId=c.id; G.tab="calls"; render(); }, {padding:"9px 14px",borderRadius:"8px",background:"#13131a",border:"1px solid #1e1e2a",color:"#aaa",fontSize:"12px",fontWeight:"600"});
+    actRow2.appendChild(logNextBtn); actRow2.appendChild(skipBtn); actRow2.appendChild(viewBtn);
+    card.appendChild(actRow2); w.appendChild(card);
+    // Up next preview
+    if (idx + 1 < sessionIds.length) {
+      var nextC = G.contacts.find(function(x){ return x.id === sessionIds[idx+1]; });
+      if (nextC) {
+        var upNext = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"8px",padding:"8px 12px",display:"flex",alignItems:"center",gap:"10px"});
+        upNext.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.07em",flexShrink:"0"}, "Up next"));
+        upNext.appendChild(avatar(nextC.name, COLORS[nextC.stage], 22));
+        upNext.appendChild(div({fontSize:"11px",color:"#aaa"}, nextC.name + " - " + nextC.title + " at " + nextC.company));
+        w.appendChild(upNext);
+      }
+    }
+    return w;
+  }
+
+  // ── NORMAL QUEUE VIEW ──
   var hdr = div({marginBottom:"14px"});
-  hdr.appendChild(div({fontSize:"19px",fontWeight:"700"}, "Today's Call Queue"));
-  hdr.appendChild(div({fontSize:"12px",color:"#888",marginTop:"3px"}, queue.length + " contacts prioritised by score and recency"));
+  var hdrTop = div({display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"3px"});
+  hdrTop.appendChild(div({fontSize:"19px",fontWeight:"700"}, "Today's Call Queue"));
+  if (queue.length > 0) {
+    hdrTop.appendChild(mkBtn("Start Dialer Session", function(){
+      G.dialerSession = queue.map(function(c){ return c.id; });
+      G.dialerIdx = 0;
+      G.dialerCallsMade = 0;
+      G.dialerActive = true;
+      render();
+    }, {padding:"7px 14px",borderRadius:"8px",background:"linear-gradient(135deg,#a78bfa,#4a9eff)",border:"none",color:"#fff",fontSize:"11px",fontWeight:"700"}));
+  }
+  hdr.appendChild(hdrTop);
+  hdr.appendChild(div({fontSize:"12px",color:"#888"}, queue.length + " contacts prioritised by score and recency"));
   w.appendChild(hdr);
 
   if (!queue.length) {
@@ -1796,11 +1972,8 @@ function renderCallQueue() {
       var sc = COLORS[c.stage];
       var r = div({display:"flex",alignItems:"center",gap:"12px",background:"#0e0f14",border:"1px solid #1a1a24",borderLeft:"3px solid "+group.color,borderRadius:"9px",padding:"11px 13px",marginBottom:"5px",cursor:"pointer"});
       r.className = "row-btn";
-      // Number badge
       r.appendChild(div({width:"22px",height:"22px",borderRadius:"50%",background:group.color+"18",border:"1px solid "+group.color+"44",display:"grid",placeItems:"center",fontSize:"9px",fontWeight:"700",color:group.color,flexShrink:"0"}, idx+1));
-      // Avatar
       r.appendChild(avatar(c.name, sc, 34));
-      // Info
       var info = div({flex:"1",minWidth:"0"});
       var nameRow = div({display:"flex",alignItems:"center",gap:"8px",marginBottom:"2px"});
       nameRow.appendChild(div({fontSize:"13px",fontWeight:"700",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}, c.name));
@@ -1812,14 +1985,12 @@ function renderCallQueue() {
       info.appendChild(div({fontSize:"10px",color:"#888"}, c.title + " at " + c.company));
       if (c.nextStep) info.appendChild(div({fontSize:"9px",color:"#4a9eff",marginTop:"3px"}, "-> " + c.nextStep));
       r.appendChild(info);
-      // Last contact + stage
       var meta = div({textAlign:"right",flexShrink:"0"});
       meta.appendChild(div({fontSize:"9px",color:c._d!==null&&c._d>=7?"#f87171":"#888"}, c._d !== null ? c._d+"d ago" : "Never contacted"));
       var sp = div({fontSize:"8px",fontWeight:"600",padding:"2px 6px",borderRadius:"100px",border:"1px solid",marginTop:"3px",display:"inline-block"});
       sp.style.color = sc.d; sp.style.borderColor = sc.b; sp.style.background = sc.bg; sp.textContent = c.stage;
       meta.appendChild(sp);
       r.appendChild(meta);
-      // Click to open drawer on calls tab
       r.addEventListener("click", (function(cId){ return function() { G.selId = cId; G.tab = "calls"; render(); }; })(c.id));
       w.appendChild(r);
     });
@@ -2033,6 +2204,21 @@ function renderForecast() {
 }
 
 // ================================================================
+// MERGE VARIABLES
+// ================================================================
+function applyMergeVars(text, c) {
+  if (!c) return text;
+  var firstName = (c.name||"").split(" ")[0];
+  return text
+    .replace(/\{\{first_name\}\}/gi, firstName)
+    .replace(/\{\{full_name\}\}/gi, c.name||"")
+    .replace(/\{\{company\}\}/gi, c.company||"")
+    .replace(/\{\{title\}\}/gi, c.title||"")
+    .replace(/\{\{industry\}\}/gi, c.industry||"")
+    .replace(/\{\{value\}\}/gi, fmtVal(c.value));
+}
+
+// ================================================================
 // TEMPLATES VIEW
 // ================================================================
 function renderTemplates() {
@@ -2043,6 +2229,12 @@ function renderTemplates() {
   hdr.appendChild(div({fontSize:"19px",fontWeight:"700"}, "Email Templates"));
   hdr.appendChild(div({fontSize:"12px",color:"#888",marginTop:"3px"}, "Save your best emails. Reuse them across contacts."));
   w.appendChild(hdr);
+
+  // Merge vars hint
+  var mergeHint = div({background:"rgba(74,158,255,0.06)",border:"1px solid rgba(74,158,255,0.15)",borderRadius:"8px",padding:"8px 11px",marginBottom:"12px",display:"flex",gap:"8px",alignItems:"flex-start"});
+  mergeHint.appendChild(div({fontSize:"10px",color:"#4a9eff",fontWeight:"700",flexShrink:"0"}, "Merge vars:"));
+  mergeHint.appendChild(div({fontSize:"10px",color:"#888",lineHeight:"1.6"}, "Use {{first_name}}, {{company}}, {{title}}, {{industry}} in your templates. When you click \"Use\" with a contact open, variables are auto-substituted."));
+  w.appendChild(mergeHint);
 
   // Add template button
   var addBtn2 = mkBtn("+ New Template", function(){ G.modal="addTemplate"; renderModal(); }, {padding:"8px 14px",borderRadius:"8px",background:"linear-gradient(135deg,#4a9eff,#a78bfa)",border:"none",color:"#fff",fontSize:"11px",fontWeight:"700",marginBottom:"14px"});
@@ -2073,11 +2265,19 @@ function renderTemplates() {
         navigator.clipboard.writeText("Subject: "+tmpl.subject+"\n\n"+tmpl.body);
         copyBtn.textContent="Copied!"; setTimeout(function(){copyBtn.textContent="Copy";},2000);
       }, {padding:"3px 8px",borderRadius:"5px",background:"#13131a",border:"1px solid #1e1e2a",color:"#aaa",fontSize:"9px",fontWeight:"600"});
+      var useBtn = mkBtn("Use", function(){
+        var selectedContact = getSelected();
+        var mergedSubject = applyMergeVars(tmpl.subject, selectedContact);
+        var mergedBody = applyMergeVars(tmpl.body, selectedContact);
+        navigator.clipboard.writeText("Subject: "+mergedSubject+"\n\n"+mergedBody);
+        useBtn.textContent = selectedContact ? "Copied (personalised)!" : "Copied!";
+        setTimeout(function(){ useBtn.textContent="Use"; }, 2500);
+      }, {padding:"3px 8px",borderRadius:"5px",background:"rgba(74,158,255,0.08)",border:"1px solid rgba(74,158,255,0.2)",color:"#4a9eff",fontSize:"9px",fontWeight:"600"});
       var delBtn = mkBtn("Del", function(){
         var t2 = getTemplates().filter(function(x){ return x.id!==tmpl.id; });
         saveTemplates(t2); render();
       }, {padding:"3px 8px",borderRadius:"5px",background:"rgba(248,113,113,0.08)",border:"1px solid rgba(248,113,113,0.2)",color:"#f87171",fontSize:"9px",fontWeight:"600"});
-      cardBtns.appendChild(copyBtn); cardBtns.appendChild(delBtn);
+      cardBtns.appendChild(useBtn); cardBtns.appendChild(copyBtn); cardBtns.appendChild(delBtn);
       cardHead.appendChild(cardBtns);
       card.appendChild(cardHead);
       var preview = div({fontSize:"10px",color:"#666",lineHeight:"1.6",whiteSpace:"pre-wrap",maxHeight:"60px",overflow:"hidden"}, tmpl.body.slice(0,180)+(tmpl.body.length>180?"...":""));
@@ -2266,6 +2466,310 @@ function renderCompetitorsTab(c) {
   return w;
 }
 
+// ================================================================
+// AI AGENTS VIEW
+// ================================================================
+function renderAgents() {
+  var w = div({maxWidth:"680px"});
+
+  var hdr = div({marginBottom:"16px"});
+  hdr.appendChild(div({fontSize:"19px",fontWeight:"700"}, "AI Agents"));
+  hdr.appendChild(div({fontSize:"12px",color:"#888",marginTop:"3px"}, "Autonomous agents that analyse your pipeline and take action on your behalf."));
+  w.appendChild(hdr);
+
+  // ── AGENT 1: Morning Pipeline Briefing ──
+  var briefingBox = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"12px",overflow:"hidden",marginBottom:"12px"});
+  var bh = div({padding:"13px 14px",borderBottom:"1px solid #1a1a24",display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:"10px"});
+  var bhInfo = div({flex:"1"});
+  var bhBadge = div({fontSize:"8px",fontWeight:"700",color:"#34d399",background:"rgba(52,211,153,0.1)",border:"1px solid rgba(52,211,153,0.2)",padding:"2px 8px",borderRadius:"100px",display:"inline-block",marginBottom:"6px"}, "PIPELINE AGENT");
+  bhInfo.appendChild(bhBadge);
+  bhInfo.appendChild(div({fontSize:"14px",fontWeight:"700",marginBottom:"3px"}, "Morning Pipeline Briefing"));
+  bhInfo.appendChild(div({fontSize:"11px",color:"#888",lineHeight:"1.5"}, "Analyses your full pipeline and generates a prioritised action plan for today — which deals to focus on, what to say, and why."));
+  bh.appendChild(bhInfo);
+  var briefingResultArea = div({padding:"0 14px 0"});
+  briefingBox.appendChild(bh); briefingBox.appendChild(briefingResultArea);
+  var runBriefBtn = mkBtn("Run Morning Briefing", null, {padding:"8px 16px",borderRadius:"8px",background:"linear-gradient(135deg,#34d399,#4a9eff)",border:"none",color:"#fff",fontSize:"11px",fontWeight:"700"});
+  bh.appendChild(div({flexShrink:"0"}, runBriefBtn));
+  runBriefBtn.addEventListener("click", function(){
+    runBriefBtn.textContent = "Analysing..."; runBriefBtn.disabled = true;
+    briefingResultArea.innerHTML = "";
+    var openDeals = G.contacts.filter(function(c){ return !["Closed Won","Closed Lost"].includes(c.stage); });
+    var dealSummaries = openDeals.slice(0,20).map(function(c){
+      return c.name + " (" + c.stage + ", BANT " + bantScore(c) + "/4, health " + (dealHealth(c)||0) + "%, " + (c.lastContact ? daysAgo(c.lastContact)+"d ago" : "never contacted") + ", $" + (parseFloat(c.value)||0).toLocaleString() + ")";
+    }).join("\n");
+    var overdue = G.contacts.flatMap(function(c){ return (c.tasks||[]).map(function(t){ return Object.assign({},t,{cName:c.name}); }); }).filter(function(t){ return !t.done && t.due < today(); }).length;
+    callAI(
+      "You are an elite B2B sales coach. Analyse this sales pipeline and generate a concise morning briefing. Return ONLY JSON: {\"todaysFocus\":\"1-2 sentence focus for the day\",\"priorityActions\":[{\"contact\":\"name\",\"action\":\"specific action\",\"reason\":\"why now\",\"urgency\":\"high|medium|low\"}],\"pipelineHealth\":\"1 sentence assessment\",\"biggestRisk\":\"the single biggest risk to hitting quota this month\",\"winOpportunity\":\"the deal most likely to close and why\"}. Limit priorityActions to top 5.",
+      "Open deals (" + openDeals.length + " total):\n" + dealSummaries + "\n\nOverdue tasks: " + overdue + "\nMonthly target: $" + (G.quota.monthlyTarget||10000).toLocaleString(),
+      900
+    ).then(function(txt){
+      var res = JSON.parse(txt);
+      var rb = div({padding:"13px 14px"});
+      // Today's focus
+      var focusBox = div({background:"rgba(52,211,153,0.06)",border:"1px solid rgba(52,211,153,0.2)",borderRadius:"9px",padding:"10px 12px",marginBottom:"12px"});
+      focusBox.appendChild(div({fontSize:"9px",color:"#34d399",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"4px"}, "Today's Focus"));
+      focusBox.appendChild(div({fontSize:"12px",color:"#e8e8f0",lineHeight:"1.6",fontWeight:"600"}, res.todaysFocus||""));
+      rb.appendChild(focusBox);
+      // Priority actions
+      if (res.priorityActions && res.priorityActions.length) {
+        rb.appendChild(div({fontSize:"9px",color:"#888",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"7px"}, "Priority Actions"));
+        res.priorityActions.forEach(function(act, i) {
+          var urgColor = act.urgency==="high"?"#f87171":act.urgency==="medium"?"#f5a623":"#4a9eff";
+          var ar = div({background:"#13131a",border:"1px solid #1e1e2a",borderLeft:"3px solid "+urgColor,borderRadius:"8px",padding:"9px 11px",marginBottom:"5px",cursor:"pointer"});
+          ar.className = "row-btn";
+          var arTop = div({display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:"8px",marginBottom:"3px"});
+          arTop.appendChild(div({fontSize:"11px",fontWeight:"700"}, (i+1)+". "+act.contact));
+          arTop.appendChild(div({fontSize:"8px",fontWeight:"700",color:urgColor,background:urgColor+"18",padding:"2px 7px",borderRadius:"100px",flexShrink:"0"}, (act.urgency||"medium").toUpperCase()));
+          ar.appendChild(arTop);
+          ar.appendChild(div({fontSize:"11px",color:"#ccc",marginBottom:"2px"}, act.action));
+          ar.appendChild(div({fontSize:"10px",color:"#666"}, act.reason));
+          // Click to navigate to contact
+          ar.addEventListener("click", (function(name){ return function(){
+            var found = G.contacts.find(function(c){ return c.name.toLowerCase().includes(name.toLowerCase()); });
+            if (found) { G.selId=found.id; G.tab="coach"; render(); }
+          }; })(act.contact));
+          rb.appendChild(ar);
+        });
+        rb.appendChild(div({height:"8px"}));
+      }
+      // Pipeline health + risk + win opp
+      var insightsGrid = div({display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"});
+      [["Pipeline Health","#4a9eff",res.pipelineHealth],["Biggest Risk","#f87171",res.biggestRisk],["Win Opportunity","#34d399",res.winOpportunity]].filter(function(a){ return a[2]; }).forEach(function(a) {
+        var ib = div({background:"#13131a",border:"1px solid #1e1e2a",borderRadius:"8px",padding:"9px 11px"});
+        ib.appendChild(div({fontSize:"9px",color:a[1],fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"4px"}, a[0]));
+        ib.appendChild(div({fontSize:"10px",color:"#aaa",lineHeight:"1.6"}, a[2]));
+        insightsGrid.appendChild(ib);
+      });
+      rb.appendChild(insightsGrid);
+      briefingResultArea.appendChild(rb);
+      runBriefBtn.textContent = "Re-run Briefing"; runBriefBtn.disabled = false;
+    }).catch(function(){ runBriefBtn.textContent = "Run Morning Briefing"; runBriefBtn.disabled = false; });
+  });
+  w.appendChild(briefingBox);
+
+  // ── AGENT 2: Deal Risk Scanner ──
+  var riskBox = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"12px",overflow:"hidden",marginBottom:"12px"});
+  var rh2 = div({padding:"13px 14px",borderBottom:"1px solid #1a1a24",display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:"10px"});
+  var rhInfo = div({flex:"1"});
+  var rhBadge = div({fontSize:"8px",fontWeight:"700",color:"#f87171",background:"rgba(248,113,113,0.1)",border:"1px solid rgba(248,113,113,0.2)",padding:"2px 8px",borderRadius:"100px",display:"inline-block",marginBottom:"6px"}, "RISK AGENT");
+  rhInfo.appendChild(rhBadge);
+  rhInfo.appendChild(div({fontSize:"14px",fontWeight:"700",marginBottom:"3px"}, "Deal Risk Scanner"));
+  rhInfo.appendChild(div({fontSize:"11px",color:"#888",lineHeight:"1.5"}, "Scans all open deals for red flags — stalled pipeline, unqualified deals in late stages, and deals at risk of slipping before close."));
+  rh2.appendChild(rhInfo);
+  var riskResultArea = div({padding:"0 14px 0"});
+  riskBox.appendChild(rh2); riskBox.appendChild(riskResultArea);
+  var scanBtn = mkBtn("Scan Pipeline for Risks", null, {padding:"8px 16px",borderRadius:"8px",background:"linear-gradient(135deg,#f87171,#f5a623)",border:"none",color:"#fff",fontSize:"11px",fontWeight:"700"});
+  rh2.appendChild(div({flexShrink:"0"}, scanBtn));
+  scanBtn.addEventListener("click", function(){
+    scanBtn.textContent = "Scanning..."; scanBtn.disabled = true;
+    riskResultArea.innerHTML = "";
+    var risks = [];
+    G.contacts.filter(function(c){ return !["Closed Won","Closed Lost"].includes(c.stage); }).forEach(function(c) {
+      var flags = [];
+      var dis5 = daysInStage(c); var d5 = daysAgo(c.lastContact); var dh5 = dealHealth(c); var bs5 = bantScore(c);
+      if (dis5 !== null && dis5 >= 14) flags.push({label:"Stalled "+dis5+"d in "+c.stage,color:"#f87171"});
+      if (d5 !== null && d5 >= 10) flags.push({label:"No contact in "+d5+" days",color:"#f5a623"});
+      if (bs5 < 2 && ["Meeting Set","Proposal Sent"].includes(c.stage)) flags.push({label:"Low BANT ("+bs5+"/4) in "+c.stage,color:"#f87171"});
+      if (dh5 !== null && dh5 < 40) flags.push({label:"Deal health critical: "+dh5+"%",color:"#f87171"});
+      var openObjs = (c.objections||[]).filter(function(o){ return !o.resolved; }).length;
+      if (openObjs >= 2) flags.push({label:openObjs+" unresolved objections",color:"#f5a623"});
+      if (flags.length > 0) risks.push({c:c, flags:flags, severity: flags.filter(function(f){ return f.color==="#f87171"; }).length});
+    });
+    risks.sort(function(a,b){ return b.severity - a.severity; });
+    var rb2 = div({padding:"13px 14px"});
+    if (!risks.length) {
+      var ok = div({background:"rgba(52,211,153,0.06)",border:"1px solid rgba(52,211,153,0.2)",borderRadius:"9px",padding:"12px",textAlign:"center"});
+      ok.appendChild(div({fontSize:"13px",fontWeight:"700",color:"#34d399",marginBottom:"3px"}, "Pipeline looks healthy!"));
+      ok.appendChild(div({fontSize:"10px",color:"#888"}, "No critical risk flags detected across open deals."));
+      rb2.appendChild(ok);
+    } else {
+      rb2.appendChild(div({fontSize:"9px",color:"#f87171",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"8px"}, risks.length + " deals at risk"));
+      risks.forEach(function(item) {
+        var rc = div({background:"#13131a",border:"1px solid rgba(248,113,113,0.2)",borderRadius:"9px",padding:"10px 12px",marginBottom:"6px",cursor:"pointer"});
+        rc.className = "row-btn";
+        var rcTop = div({display:"flex",alignItems:"center",gap:"9px",marginBottom:"6px"});
+        rcTop.appendChild(avatar(item.c.name, COLORS[item.c.stage], 28));
+        var rcInfo = div({flex:"1",minWidth:"0"});
+        rcInfo.appendChild(div({fontSize:"12px",fontWeight:"700"}, item.c.name));
+        rcInfo.appendChild(div({fontSize:"10px",color:"#888"}, item.c.company + " - " + item.c.stage + " - " + fmtVal(item.c.value)));
+        rcTop.appendChild(rcInfo);
+        rc.appendChild(rcTop);
+        var flagsRow = div({display:"flex",gap:"4px",flexWrap:"wrap"});
+        item.flags.forEach(function(f){ flagsRow.appendChild(div({fontSize:"9px",fontWeight:"600",color:f.color,background:f.color+"15",border:"1px solid "+f.color+"33",padding:"2px 8px",borderRadius:"100px"}, f.label)); });
+        rc.appendChild(flagsRow);
+        rc.addEventListener("click", (function(cId){ return function(){ G.selId=cId; G.tab="bant"; render(); }; })(item.c.id));
+        rb2.appendChild(rc);
+      });
+      // AI commentary on biggest risk
+      if (risks.length > 0) {
+        var worstDeals = risks.slice(0,5).map(function(r){ return r.c.name + " (" + r.flags.map(function(f){ return f.label; }).join(", ") + ")"; }).join("\n");
+        callAI(
+          "You are a sales coach. In 2-3 sentences, give actionable advice on how to address these pipeline risks. Be direct and specific.",
+          "Deals at risk:\n" + worstDeals,
+          250
+        ).then(function(advice){
+          var advBox = div({background:"rgba(167,139,250,0.06)",border:"1px solid rgba(167,139,250,0.2)",borderRadius:"8px",padding:"10px 12px",marginTop:"10px"});
+          advBox.appendChild(div({fontSize:"9px",color:"#a78bfa",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"4px"}, "AI Coach Advice"));
+          advBox.appendChild(div({fontSize:"11px",color:"#ccc",lineHeight:"1.6"}, advice));
+          rb2.appendChild(advBox);
+        }).catch(function(){});
+      }
+    }
+    riskResultArea.appendChild(rb2);
+    scanBtn.textContent = "Re-scan"; scanBtn.disabled = false;
+  });
+  w.appendChild(riskBox);
+
+  // ── AGENT 3: Email Reply Drafter ──
+  var replyBox = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"12px",overflow:"hidden",marginBottom:"12px"});
+  var rplyHdr = div({padding:"13px 14px",borderBottom:"1px solid #1a1a24"});
+  var rplyBadge = div({fontSize:"8px",fontWeight:"700",color:"#a78bfa",background:"rgba(167,139,250,0.1)",border:"1px solid rgba(167,139,250,0.2)",padding:"2px 8px",borderRadius:"100px",display:"inline-block",marginBottom:"6px"}, "REPLY AGENT");
+  rplyHdr.appendChild(rplyBadge);
+  rplyHdr.appendChild(div({fontSize:"14px",fontWeight:"700",marginBottom:"3px"}, "Email Reply Drafter"));
+  rplyHdr.appendChild(div({fontSize:"11px",color:"#888",lineHeight:"1.5"}, "Paste an inbound email from a prospect. The agent drafts a ready-to-send reply that moves the deal forward."));
+  replyBox.appendChild(rplyHdr);
+  var rplyBody = div({padding:"13px 14px"});
+  // Contact selector
+  var rplyContactState = {id: G.selId || ""};
+  var contactOpts = [["","No contact selected (generic reply)"]].concat(
+    G.contacts.map(function(c){ return [c.id, c.name + " - " + c.company]; })
+  );
+  rplyBody.appendChild(mkLabel("Contact (optional - personalises the reply)",
+    mkSelect(rplyContactState.id, contactOpts, function(v){ rplyContactState.id = v; }, {marginBottom:"8px"})
+  ));
+  rplyBody.appendChild(div({height:"6px"}));
+  var inboundInput = mkTextarea("", function(){}, {minHeight:"90px"});
+  inboundInput.placeholder = "Paste the inbound email you received from the prospect...";
+  rplyBody.appendChild(mkLabel("Inbound Email", inboundInput));
+  rplyBody.appendChild(div({height:"10px"}));
+  var draftReplyBtn = mkBtn("Draft Reply", null, {padding:"9px",borderRadius:"8px",background:"linear-gradient(135deg,#a78bfa,#4a9eff)",border:"none",color:"#fff",fontSize:"12px",fontWeight:"700",width:"100%"});
+  var replyResultArea = div({});
+  draftReplyBtn.addEventListener("click", function(){
+    var inbound = inboundInput.value.trim();
+    if (!inbound) return;
+    draftReplyBtn.textContent = "Drafting..."; draftReplyBtn.disabled = true;
+    replyResultArea.innerHTML = "";
+    var contact = rplyContactState.id ? G.contacts.find(function(c){ return c.id === rplyContactState.id; }) : null;
+    var ctx = contact ? "Contact: " + contact.name + ", " + contact.title + " at " + contact.company + "\nStage: " + contact.stage + "\nBANT: " + bantScore(contact) + "/4\nNotes: " + (contact.notes||"none") + "\n\n" : "";
+    callAI(
+      "You are an elite B2B sales rep. Draft a concise, compelling reply to this inbound email that moves the conversation forward. Return ONLY JSON: {\"subject\":\"Re: ...\",\"body\":\"email body under 120 words\",\"intent\":\"what this reply is trying to achieve\"}",
+      ctx + "Inbound email:\n" + inbound,
+      450
+    ).then(function(txt){
+      var res = JSON.parse(txt);
+      var rb3 = div({background:"#13131a",border:"1px solid rgba(167,139,250,0.25)",borderRadius:"10px",overflow:"hidden",marginTop:"10px"});
+      var rb3h = div({padding:"7px 10px",borderBottom:"1px solid #1e1e2a",display:"flex",alignItems:"center",justifyContent:"space-between"});
+      rb3h.appendChild(div({fontSize:"9px",fontWeight:"700",color:"#a78bfa",textTransform:"uppercase",letterSpacing:"0.07em"}, "Drafted Reply"));
+      var cpReply = mkBtn("Copy", function(){
+        navigator.clipboard.writeText("Subject: "+res.subject+"\n\n"+res.body);
+        cpReply.textContent="Copied!"; setTimeout(function(){cpReply.textContent="Copy";},2000);
+      }, {padding:"2px 7px",borderRadius:"4px",background:"#1e1e2a",border:"1px solid #2a2a3a",color:"#aaa",fontSize:"9px",fontWeight:"600"});
+      rb3h.appendChild(cpReply); rb3.appendChild(rb3h);
+      var rb3b = div({padding:"10px 11px"});
+      if (res.intent) {
+        rb3b.appendChild(div({fontSize:"9px",color:"#555",fontWeight:"700",marginBottom:"4px",textTransform:"uppercase",letterSpacing:"0.07em"}, "Intent: " + res.intent));
+      }
+      rb3b.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.07em",fontWeight:"700",marginBottom:"2px"}, "Subject"));
+      rb3b.appendChild(div({fontSize:"11px",fontWeight:"600",fontStyle:"italic",marginBottom:"8px"}, res.subject));
+      rb3b.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.07em",fontWeight:"700",marginBottom:"4px"}, "Body"));
+      rb3b.appendChild(div({fontSize:"10px",color:"#ccc",lineHeight:"1.75",whiteSpace:"pre-wrap"}, res.body));
+      rb3.appendChild(rb3b);
+      // Log to contact
+      if (contact) {
+        var logRow = div({padding:"7px 10px",borderTop:"1px solid #1e1e2a"});
+        var logReplyBtn = mkBtn("Log Outbound Reply to " + contact.name, function(){
+          updateContact(contact.id, {emails:(contact.emails||[]).concat([{id:"e_"+Date.now(),subject:res.subject,preview:res.body.slice(0,100),date:today(),direction:"out"}]),lastContact:today()});
+          logReplyBtn.textContent="Logged!"; logReplyBtn.disabled=true;
+        }, {padding:"6px",borderRadius:"6px",background:"rgba(167,139,250,0.1)",border:"1px solid rgba(167,139,250,0.25)",color:"#a78bfa",fontSize:"10px",fontWeight:"600",width:"100%"});
+        logRow.appendChild(logReplyBtn); rb3.appendChild(logRow);
+      }
+      replyResultArea.appendChild(rb3);
+      draftReplyBtn.textContent = "Draft Reply"; draftReplyBtn.disabled = false;
+    }).catch(function(){ draftReplyBtn.textContent = "Draft Reply"; draftReplyBtn.disabled = false; });
+  });
+  rplyBody.appendChild(draftReplyBtn); rplyBody.appendChild(replyResultArea);
+  replyBox.appendChild(rplyBody);
+  w.appendChild(replyBox);
+
+  // ── AGENT 4: Sequence Optimizer ──
+  var seqOptBox = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"12px",overflow:"hidden",marginBottom:"12px"});
+  var soHdr = div({padding:"13px 14px",borderBottom:"1px solid #1a1a24",display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:"10px"});
+  var soInfo = div({flex:"1"});
+  var soBadge = div({fontSize:"8px",fontWeight:"700",color:"#38bdf8",background:"rgba(56,189,248,0.1)",border:"1px solid rgba(56,189,248,0.2)",padding:"2px 8px",borderRadius:"100px",display:"inline-block",marginBottom:"6px"}, "SEQUENCE AGENT");
+  soInfo.appendChild(soBadge);
+  soInfo.appendChild(div({fontSize:"14px",fontWeight:"700",marginBottom:"3px"}, "Sequence Optimizer"));
+  soInfo.appendChild(div({fontSize:"11px",color:"#888",lineHeight:"1.5"}, "Analyses all active sequences across your pipeline. Surfaces contacts where sequences have stalled and suggests how to re-engage."));
+  soHdr.appendChild(soInfo);
+  var seqResultArea = div({padding:"0 14px 0"});
+  seqOptBox.appendChild(soHdr); seqOptBox.appendChild(seqResultArea);
+  var optimiseBtn = mkBtn("Analyse Sequences", null, {padding:"8px 16px",borderRadius:"8px",background:"linear-gradient(135deg,#38bdf8,#a78bfa)",border:"none",color:"#fff",fontSize:"11px",fontWeight:"700"});
+  soHdr.appendChild(div({flexShrink:"0"}, optimiseBtn));
+  optimiseBtn.addEventListener("click", function(){
+    optimiseBtn.textContent = "Analysing..."; optimiseBtn.disabled = true;
+    seqResultArea.innerHTML = "";
+    var seqStats = [];
+    G.contacts.forEach(function(c){
+      (c.sequences||[]).forEach(function(seq){
+        var total = seq.steps.length;
+        var sent = seq.steps.filter(function(s){ return s.status==="sent"; }).length;
+        var replied = seq.steps.filter(function(s){ return s.status==="replied"; }).length;
+        var pending = seq.steps.filter(function(s){ return s.status==="pending"; }).length;
+        var overdue = 0;
+        if (seq.active) {
+          var created = new Date(seq.createdDate + "T00:00:00").getTime();
+          seq.steps.forEach(function(step){
+            if (step.status==="pending" && Date.now() > created + (step.day-1)*86400000) overdue++;
+          });
+        }
+        seqStats.push({c:c, seq:seq, total:total, sent:sent, replied:replied, pending:pending, overdue:overdue, active:seq.active});
+      });
+    });
+    var active = seqStats.filter(function(s){ return s.active; });
+    var rb4 = div({padding:"13px 14px"});
+    if (!active.length) {
+      rb4.appendChild(div({fontSize:"12px",color:"#666",textAlign:"center",padding:"18px"}, "No active sequences found. Generate sequences from individual contacts."));
+    } else {
+      rb4.appendChild(div({fontSize:"9px",color:"#888",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"8px"}, active.length + " active sequences"));
+      active.forEach(function(item){
+        var sc2 = COLORS[item.c.stage];
+        var sr = div({background:"#13131a",border:"1px solid "+(item.overdue>0?"rgba(245,166,35,0.3)":"#1e1e2a"),borderRadius:"9px",padding:"10px 12px",marginBottom:"6px",cursor:"pointer"});
+        sr.className = "row-btn";
+        var srTop = div({display:"flex",alignItems:"center",gap:"9px",marginBottom:"8px"});
+        srTop.appendChild(avatar(item.c.name, sc2, 28));
+        var srInfo = div({flex:"1",minWidth:"0"});
+        srInfo.appendChild(div({fontSize:"12px",fontWeight:"700"}, item.c.name));
+        srInfo.appendChild(div({fontSize:"9px",color:"#888"}, item.seq.name + " - " + item.c.company));
+        srTop.appendChild(srInfo);
+        sr.appendChild(srTop);
+        var srStats = div({display:"flex",gap:"5px",flexWrap:"wrap"});
+        if (item.sent > 0) srStats.appendChild(div({fontSize:"9px",padding:"2px 7px",borderRadius:"100px",color:"#4a9eff",background:"rgba(74,158,255,0.1)"}, item.sent + " sent"));
+        if (item.replied > 0) srStats.appendChild(div({fontSize:"9px",padding:"2px 7px",borderRadius:"100px",color:"#34d399",background:"rgba(52,211,153,0.1)"}, item.replied + " replied"));
+        if (item.overdue > 0) srStats.appendChild(div({fontSize:"9px",padding:"2px 7px",borderRadius:"100px",color:"#f5a623",background:"rgba(245,166,35,0.1)",fontWeight:"700"}, item.overdue + " overdue"));
+        if (item.pending > 0) srStats.appendChild(div({fontSize:"9px",padding:"2px 7px",borderRadius:"100px",color:"#666",background:"#1e1e2a"}, item.pending + " pending"));
+        sr.appendChild(srStats);
+        sr.addEventListener("click", (function(cId){ return function(){ G.selId=cId; G.tab="sequence"; render(); }; })(item.c.id));
+        rb4.appendChild(sr);
+      });
+      // AI optimization tips
+      var seqSummary = active.map(function(s){ return s.c.name + ": " + s.sent + "/" + s.total + " sent, " + s.replied + " replied, " + s.overdue + " overdue"; }).join("\n");
+      callAI(
+        "Sales coach. Give 2-3 specific tips to improve these sequences. Return plain text only, no JSON. Be direct.",
+        "Active sequences:\n" + seqSummary,
+        200
+      ).then(function(tips){
+        var tipsBox = div({background:"rgba(56,189,248,0.06)",border:"1px solid rgba(56,189,248,0.2)",borderRadius:"8px",padding:"10px 12px",marginTop:"10px"});
+        tipsBox.appendChild(div({fontSize:"9px",color:"#38bdf8",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:"5px"}, "Optimisation Tips"));
+        tipsBox.appendChild(div({fontSize:"11px",color:"#ccc",lineHeight:"1.7",whiteSpace:"pre-wrap"}, tips));
+        rb4.appendChild(tipsBox);
+      }).catch(function(){});
+    }
+    seqResultArea.appendChild(rb4);
+    optimiseBtn.textContent = "Re-analyse"; optimiseBtn.disabled = false;
+  });
+  w.appendChild(seqOptBox);
+  return w;
+}
+
 function exportCSV() {
   var headers = ["Name","Title","Company","Email","Phone","Stage","Score","Value","Industry","Source","Last Contact","Next Step"];
   var rows = G.contacts.map(function(c) {
@@ -2290,6 +2794,27 @@ function render() {
   renderDrawer();
   renderModal();
 }
+
+// ================================================================
+// KEYBOARD SHORTCUTS
+// ================================================================
+document.addEventListener("keydown", function(e) {
+  var tag = (e.target.tagName||"").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") return;
+  if (e.key === "Escape") {
+    if (G.modal) { G.modal = null; document.getElementById("modal").innerHTML = ""; return; }
+    if (G.selId) { G.selId = null; render(); return; }
+    if (G.dialerActive) { G.dialerActive = false; G.dialerSession = null; render(); return; }
+  }
+  if (e.key === "?" && !G.modal) { G.modal = "shortcuts"; renderModal(); return; }
+  if (e.key === "n" && !G.selId && !G.modal) { G.modal = "addContact"; renderModal(); return; }
+  if (G.selId && !G.modal) {
+    if (e.key === "e") { G.tab = "ai"; render(); return; }
+    if (e.key === "c") { G.modal = "logCall"; renderModal(); return; }
+    if (e.key === "t") { G.modal = "addTask"; renderModal(); return; }
+    if (e.key === "m") { G.modal = "addMeeting"; renderModal(); return; }
+  }
+});
 
 init();
 </script>
