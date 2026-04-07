@@ -1,0 +1,118 @@
+{
+  "name": "TariqCRM - AI Follow-up Generator",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "crm-followup-ready",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson"
+      },
+      "id": "node_webhook_followup",
+      "name": "Webhook: Follow-up Ready",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body;\nconst { contactId, followUp } = body;\n\nif (!contactId || !followUp) {\n  throw new Error('Missing contactId or followUp in payload');\n}\n\nconst { followUpEmail, nextTask, coachingNote } = followUp;\n\nif (!followUpEmail || !nextTask) {\n  throw new Error('Malformed follow-up structure');\n}\n\n// Calculate task due date\nconst dueDate = new Date();\ndueDate.setDate(dueDate.getDate() + (nextTask.daysFromNow || 1));\n\nreturn [{\n  json: {\n    contactId,\n    followUpEmail,\n    nextTask: {\n      ...nextTask,\n      dueDate: dueDate.toISOString().split('T')[0]\n    },\n    coachingNote,\n    processedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node_parse_followup",
+      "name": "Parse Follow-up Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [470, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:3001/api/n8n/task-created",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-webhook-secret", "value": "={{ $env.WEBHOOK_SECRET }}" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"contactId\": \"{{ $json.contactId }}\",\n  \"task\": {\n    \"title\": \"{{ $json.nextTask.title }}\",\n    \"priority\": \"{{ $json.nextTask.priority }}\",\n    \"due\": \"{{ $json.nextTask.dueDate }}\",\n    \"done\": false,\n    \"source\": \"n8n-followup-ai\",\n    \"coachingNote\": \"{{ $json.coachingNote }}\",\n    \"suggestedEmailSubject\": \"{{ $json.followUpEmail.subject }}\"\n  }\n}",
+        "options": {}
+      },
+      "id": "node_create_task",
+      "name": "Create Follow-up Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [690, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $('Parse Follow-up Payload').item.json;\n\n// Build notification for the sales rep\nconst keyPoints = (data.followUpEmail.keyPoints || []).map(p => `• ${p}`).join('\\n');\n\nreturn [{\n  json: {\n    text: `🤖 *AI Follow-up Suggestion Ready*`,\n    blocks: [\n      {\n        type: 'section',\n        text: {\n          type: 'mrkdwn',\n          text: `*🤖 AI Follow-up Generated* for Contact ${data.contactId}\\n*Coaching Note:* _${data.coachingNote}_`\n        }\n      },\n      {\n        type: 'section',\n        text: {\n          type: 'mrkdwn',\n          text: `*📧 Suggested Email Subject:* ${data.followUpEmail.subject}\\n*Key Points:*\\n${keyPoints}`\n        }\n      },\n      {\n        type: 'section',\n        text: {\n          type: 'mrkdwn',\n          text: `*✅ Task Created:* \"${data.nextTask.title}\" due ${data.nextTask.dueDate} (${data.nextTask.priority} priority)`\n        }\n      }\n    ]\n  }\n}];"
+      },
+      "id": "node_build_notif",
+      "name": "Build Rep Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [690, 420]
+    },
+    {
+      "parameters": {
+        "channel": "#sales-coaching",
+        "text": "={{ $json.text }}",
+        "blocksUi": "={{ JSON.stringify($json.blocks) }}",
+        "otherOptions": {}
+      },
+      "id": "node_slack_notify",
+      "name": "Slack: Coaching Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [910, 420],
+      "credentials": {
+        "slackApi": { "id": "slack_creds", "name": "Slack API" }
+      }
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            { "name": "status", "value": "followup-workflow-complete" },
+            { "name": "contactId", "value": "={{ $('Parse Follow-up Payload').item.json.contactId }}" }
+          ]
+        }
+      },
+      "id": "node_done",
+      "name": "Done",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1130, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: Follow-up Ready": {
+      "main": [[{ "node": "Parse Follow-up Payload", "type": "main", "index": 0 }]]
+    },
+    "Parse Follow-up Payload": {
+      "main": [
+        [{ "node": "Create Follow-up Task", "type": "main", "index": 0 }],
+        [{ "node": "Build Rep Notification", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Follow-up Task": {
+      "main": [[{ "node": "Done", "type": "main", "index": 0 }]]
+    },
+    "Build Rep Notification": {
+      "main": [[{ "node": "Slack: Coaching Notification", "type": "main", "index": 0 }]]
+    },
+    "Slack: Coaching Notification": {
+      "main": [[{ "node": "Done", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["crm", "ai", "coaching", "followup"],
+  "meta": {
+    "description": "Receives AI-generated follow-up suggestions from the bridge service after calls/meetings. Creates tasks in the CRM and sends coaching notifications to the sales team in Slack."
+  }
+}

@@ -1,0 +1,148 @@
+{
+  "name": "TariqCRM - Lead Enrichment",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "crm-enrichment-complete",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson"
+      },
+      "id": "node_webhook_enrichment",
+      "name": "Webhook: Enrichment Complete",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { contactId, enrichment } = $input.first().json.body;\n\nif (!contactId || !enrichment) {\n  throw new Error('Missing contactId or enrichment in payload');\n}\n\nreturn [\n  {\n    json: {\n      contactId,\n      enrichment,\n      processedAt: new Date().toISOString()\n    }\n  }\n];"
+      },
+      "id": "node_parse_enrichment",
+      "name": "Parse Enrichment Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [470, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "id": "has_urgency",
+              "leftValue": "={{ $json.enrichment.urgencySignals.length }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "node_check_urgency",
+      "name": "Has Urgency Signals?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [690, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:3001/api/n8n/enrichment-result",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-webhook-secret", "value": "={{ $env.WEBHOOK_SECRET }}" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "contactId", "value": "={{ $('Parse Enrichment Payload').item.json.contactId }}" },
+            { "name": "enrichment", "value": "={{ $('Parse Enrichment Payload').item.json.enrichment }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_store_enrichment",
+      "name": "Store Enrichment Result",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [910, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { contactId, enrichment } = $('Parse Enrichment Payload').item.json;\n\n// Build a Slack notification message\nconst urgencyList = enrichment.urgencySignals.map(s => `• ${s}`).join('\\n');\nconst talkingPoints = enrichment.talkingPoints.slice(0, 2).join(' | ');\n\nreturn [\n  {\n    json: {\n      text: `🔥 *Hot Lead Alert* — Contact ID: ${contactId}`,\n      blocks: [\n        {\n          type: 'section',\n          text: {\n            type: 'mrkdwn',\n            text: `*🔥 Urgent Lead Detected*\\n*Buyer Role:* ${enrichment.estimatedBuyerRole}\\n*Approach:* ${enrichment.suggestedApproach}`\n          }\n        },\n        {\n          type: 'section',\n          text: {\n            type: 'mrkdwn',\n            text: `*Urgency Signals:*\\n${urgencyList}`\n          }\n        },\n        {\n          type: 'section',\n          text: {\n            type: 'mrkdwn',\n            text: `*Recommended First Message:*\\n_${enrichment.recommendedFirstMessage}_`\n          }\n        }\n      ]\n    }\n  }\n];"
+      },
+      "id": "node_build_alert",
+      "name": "Build Urgency Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [910, 420]
+    },
+    {
+      "parameters": {
+        "channel": "#sales-alerts",
+        "text": "={{ $json.text }}",
+        "blocksUi": "={{ JSON.stringify($json.blocks) }}",
+        "otherOptions": {}
+      },
+      "id": "node_slack_alert",
+      "name": "Slack: Urgent Lead Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1130, 420],
+      "credentials": {
+        "slackApi": { "id": "slack_creds", "name": "Slack API" }
+      }
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            { "name": "status", "value": "enrichment-workflow-complete" },
+            { "name": "contactId", "value": "={{ $('Parse Enrichment Payload').item.json.contactId }}" }
+          ]
+        }
+      },
+      "id": "node_complete",
+      "name": "Complete",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1350, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: Enrichment Complete": {
+      "main": [[{ "node": "Parse Enrichment Payload", "type": "main", "index": 0 }]]
+    },
+    "Parse Enrichment Payload": {
+      "main": [[{ "node": "Has Urgency Signals?", "type": "main", "index": 0 }]]
+    },
+    "Has Urgency Signals?": {
+      "main": [
+        [{ "node": "Store Enrichment Result", "type": "main", "index": 0 }],
+        [{ "node": "Build Urgency Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Store Enrichment Result": {
+      "main": [[{ "node": "Complete", "type": "main", "index": 0 }]]
+    },
+    "Build Urgency Alert": {
+      "main": [[{ "node": "Slack: Urgent Lead Alert", "type": "main", "index": 0 }]]
+    },
+    "Slack: Urgent Lead Alert": {
+      "main": [[{ "node": "Complete", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": ["crm", "ai", "lead-enrichment"],
+  "meta": {
+    "description": "Processes AI lead enrichment results from the CRM bridge service. Routes urgent leads to Slack alerts and stores all results back to the service."
+  }
+}

@@ -1,0 +1,191 @@
+{
+  "name": "TariqCRM - Deal Health Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "crm-health-alert",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson"
+      },
+      "id": "node_webhook_health",
+      "name": "Webhook: Health Alert",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 8 * * 1-5" }]
+        }
+      },
+      "id": "node_schedule",
+      "name": "Schedule: Weekdays 8AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [250, 500]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:3001/api/contacts",
+        "options": {}
+      },
+      "id": "node_fetch_contacts",
+      "name": "Fetch All Contacts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [470, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "// When triggered by webhook, use that risk data directly\n// When triggered by schedule, the risks come from the HTTP call above\nlet risks = [];\nlet source = 'schedule';\n\nif ($input.first().json.body && $input.first().json.body.risks) {\n  // Webhook path - bridge service already ran AI analysis\n  risks = $input.first().json.body.risks;\n  source = 'webhook';\n} else {\n  // Schedule path - need to analyze from contact data\n  // This is a fallback; primary analysis runs in the bridge service\n  risks = [];\n  source = 'schedule-fallback';\n}\n\nif (risks.length === 0) {\n  return [{ json: { noRisks: true, source } }];\n}\n\n// Split risks into items for parallel processing\nreturn risks.map(risk => ({ json: { ...risk, source } }));"
+      },
+      "id": "node_parse_risks",
+      "name": "Parse Risk Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [690, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "id": "no_risks",
+              "leftValue": "={{ $json.noRisks }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "node_check_risks",
+      "name": "Any At-Risk Deals?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [910, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Group all risk items into a single Slack message\nconst items = $input.all();\n\nconst highRisk = items.filter(i => i.json.riskLevel === 'high');\nconst mediumRisk = items.filter(i => i.json.riskLevel === 'medium');\n\nconst formatRisk = (item) => {\n  const reasons = (item.json.riskReasons || []).join(', ');\n  const actions = (item.json.recommendedActions || []).slice(0, 2).join(' | ');\n  return `• *Contact ${item.json.contactId}* — ${reasons}\\n  _Actions: ${actions}_`;\n};\n\nlet messageText = `📊 *Daily Deal Health Report* — ${new Date().toLocaleDateString()}\\n`;\nmessageText += `*${items.length} deals need attention*\\n\\n`;\n\nif (highRisk.length > 0) {\n  messageText += `🔴 *HIGH RISK (${highRisk.length}):*\\n${highRisk.map(formatRisk).join('\\n')}\\n\\n`;\n}\nif (mediumRisk.length > 0) {\n  messageText += `🟡 *MEDIUM RISK (${mediumRisk.length}):*\\n${mediumRisk.map(formatRisk).join('\\n')}\\n`;\n}\n\nreturn [{ json: { text: messageText, riskCount: items.length, highCount: highRisk.length } }];"
+      },
+      "id": "node_build_report",
+      "name": "Build Health Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1130, 250]
+    },
+    {
+      "parameters": {
+        "channel": "#sales-pipeline",
+        "text": "={{ $json.text }}",
+        "otherOptions": {}
+      },
+      "id": "node_slack_report",
+      "name": "Slack: Daily Health Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1350, 250],
+      "credentials": {
+        "slackApi": { "id": "slack_creds", "name": "Slack API" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "id": "is_high_risk",
+              "leftValue": "={{ $json.riskLevel }}",
+              "rightValue": "high",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "node_filter_high",
+      "name": "High Risk Only?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1130, 500]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:3001/api/n8n/task-created",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-webhook-secret", "value": "={{ $env.WEBHOOK_SECRET }}" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"contactId\": \"{{ $json.contactId }}\",\n  \"task\": {\n    \"title\": \"⚠️ HIGH RISK: {{ $json.urgency }}\",\n    \"priority\": \"high\",\n    \"due\": \"{{ new Date(Date.now() + 86400000).toISOString().split('T')[0] }}\",\n    \"done\": false,\n    \"source\": \"n8n-health-monitor\",\n    \"riskReasons\": {{ JSON.stringify($json.riskReasons) }},\n    \"recommendedActions\": {{ JSON.stringify($json.recommendedActions) }}\n  }\n}",
+        "options": {}
+      },
+      "id": "node_create_task",
+      "name": "Create Urgent Task in CRM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1350, 450]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [{ "name": "status", "value": "no-risks-today" }]
+        }
+      },
+      "id": "node_no_risk",
+      "name": "No Action Needed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1130, 700]
+    }
+  ],
+  "connections": {
+    "Webhook: Health Alert": {
+      "main": [[{ "node": "Parse Risk Data", "type": "main", "index": 0 }]]
+    },
+    "Schedule: Weekdays 8AM": {
+      "main": [[{ "node": "Fetch All Contacts", "type": "main", "index": 0 }]]
+    },
+    "Fetch All Contacts": {
+      "main": [[{ "node": "Parse Risk Data", "type": "main", "index": 0 }]]
+    },
+    "Parse Risk Data": {
+      "main": [[{ "node": "Any At-Risk Deals?", "type": "main", "index": 0 }]]
+    },
+    "Any At-Risk Deals?": {
+      "main": [
+        [
+          { "node": "Build Health Report", "type": "main", "index": 0 },
+          { "node": "Filter High Risk Only?", "type": "main", "index": 0 }
+        ],
+        [{ "node": "No Action Needed", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Health Report": {
+      "main": [[{ "node": "Slack: Daily Health Report", "type": "main", "index": 0 }]]
+    },
+    "Filter High Risk Only?": {
+      "main": [
+        [{ "node": "Create Urgent Task in CRM", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["crm", "monitoring", "deals"],
+  "meta": {
+    "description": "Monitors deal health daily at 8AM on weekdays. Receives AI risk analysis from the bridge service, posts a Slack report, and auto-creates urgent tasks in the CRM for high-risk deals."
+  }
+}

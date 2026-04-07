@@ -1,0 +1,131 @@
+{
+  "name": "TariqCRM - Email Sequence Sender",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "crm-send-email",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson"
+      },
+      "id": "node_webhook_send_email",
+      "name": "Webhook: Send Scheduled Email",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body;\nconst { emailId, contactId, subject, body: emailBody, sequenceName, step } = body;\n\nif (!contactId || !subject || !emailBody) {\n  throw new Error('Missing required email fields');\n}\n\n// Validate this is a legitimate sequence step\nconst validSequences = ['nurture-sequence', 'follow-up-sequence', 'onboarding-sequence'];\nif (!validSequences.includes(sequenceName)) {\n  throw new Error(`Unknown sequence: ${sequenceName}`);\n}\n\nreturn [{\n  json: {\n    emailId,\n    contactId,\n    subject,\n    emailBody,\n    sequenceName,\n    step,\n    validatedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node_validate_email",
+      "name": "Validate Email Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [470, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:3001/api/contacts/={{ $json.contactId }}",
+        "options": {}
+      },
+      "id": "node_fetch_contact",
+      "name": "Fetch Contact Details",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [690, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const contact = $input.first().json.data;\nconst emailData = $('Validate Email Payload').item.json;\n\nif (!contact || !contact.email) {\n  throw new Error('Contact has no email address');\n}\n\nreturn [{\n  json: {\n    ...emailData,\n    toEmail: contact.email,\n    toName: contact.name,\n    company: contact.company,\n    // Personalize the email body\n    personalizedBody: emailData.emailBody\n      .replace(/\\{name\\}/g, contact.name)\n      .replace(/\\{company\\}/g, contact.company || 'your company')\n      .replace(/\\{title\\}/g, contact.title || 'there')\n  }\n}];"
+      },
+      "id": "node_personalize",
+      "name": "Personalize Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [910, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SMTP_FROM_EMAIL }}",
+        "toEmail": "={{ $json.toEmail }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.personalizedBody }}",
+        "options": {
+          "replyTo": "={{ $env.SMTP_FROM_EMAIL }}"
+        }
+      },
+      "id": "node_send_email",
+      "name": "Send Email via SMTP",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1130, 200],
+      "credentials": {
+        "smtp": { "id": "smtp_creds", "name": "SMTP Account" }
+      }
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:3001/api/contacts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-webhook-secret", "value": "={{ $env.WEBHOOK_SECRET }}" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"id\": \"{{ $('Personalize Email').item.json.contactId }}\",\n  \"lastContact\": \"{{ new Date().toISOString() }}\",\n  \"n8nSequenceStep\": {{ $('Personalize Email').item.json.step }},\n  \"n8nSequenceName\": \"{{ $('Personalize Email').item.json.sequenceName }}\"\n}",
+        "options": {}
+      },
+      "id": "node_log_activity",
+      "name": "Log Email Activity to CRM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1130, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const emailData = $('Personalize Email').item.json;\n\nreturn [{\n  json: {\n    status: 'email-sent',\n    emailId: emailData.emailId,\n    contactId: emailData.contactId,\n    sequenceName: emailData.sequenceName,\n    step: emailData.step,\n    sentTo: emailData.toEmail,\n    sentAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node_done",
+      "name": "Done",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1350, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: Send Scheduled Email": {
+      "main": [[{ "node": "Validate Email Payload", "type": "main", "index": 0 }]]
+    },
+    "Validate Email Payload": {
+      "main": [[{ "node": "Fetch Contact Details", "type": "main", "index": 0 }]]
+    },
+    "Fetch Contact Details": {
+      "main": [[{ "node": "Personalize Email", "type": "main", "index": 0 }]]
+    },
+    "Personalize Email": {
+      "main": [
+        [{ "node": "Send Email via SMTP", "type": "main", "index": 0 }],
+        [{ "node": "Log Email Activity to CRM", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Email via SMTP": {
+      "main": [[{ "node": "Done", "type": "main", "index": 0 }]]
+    },
+    "Log Email Activity to CRM": {
+      "main": [[{ "node": "Done", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["crm", "email", "sequences"],
+  "meta": {
+    "description": "Receives scheduled email jobs from the CRM bridge, personalizes them with contact data, sends via SMTP, and logs the activity back to the CRM."
+  }
+}

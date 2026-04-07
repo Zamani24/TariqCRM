@@ -232,7 +232,13 @@ var G = {
   dragOver: null,
   quota: {emails:50,calls:20,meetings:10,monthlyTarget:15000},
   icpConfig: {industries:["SaaS","Software","Tech","AI","Fintech"], titles:["RevOps","Sales","GTM"], minDeal:5000, maxDeal:50000},
-  forecastView: false
+  forecastView: false,
+  n8n: {
+    enabled: false,
+    serviceUrl: "http://localhost:3001",
+    webhookSecret: "dev-secret",
+    logs: []
+  }
 };
 
 function init() {
@@ -255,8 +261,10 @@ function persist() {
 }
 
 function updateContact(id, patch) {
+  var previousStage = null;
   G.contacts = G.contacts.map(function(c) {
     if (c.id === id) {
+      if (patch.stage && patch.stage !== c.stage) previousStage = c.stage;
       patch = recordStageEntry(c, patch);
       return Object.assign({}, c, patch);
     }
@@ -267,6 +275,11 @@ function updateContact(id, patch) {
   }
   persist();
   render();
+  // N8N: fire stage-change automation after render
+  if (previousStage !== null && G.n8n.enabled) {
+    var updated = G.contacts.find(function(c) { return c.id === id; });
+    if (updated) n8nTriggerStageChange(updated, previousStage);
+  }
 }
 
 function deleteContact(id) {
@@ -459,7 +472,7 @@ function renderSidebar() {
 
   // Nav
   var nav = div({display:"flex",flexDirection:"column",gap:"1px",padding:"9px 7px",flex:"1"});
-  var navItems = [["signal","Signal Feed"],["pipeline","Pipeline"],["forecast","Forecast"],["contacts","Contacts"],["tasks","Tasks"],["callqueue","Call Queue"],["cal","Calendar"],["stats","Performance"],["templates","Templates"]];
+  var navItems = [["signal","Signal Feed"],["pipeline","Pipeline"],["forecast","Forecast"],["contacts","Contacts"],["tasks","Tasks"],["callqueue","Call Queue"],["cal","Calendar"],["stats","Performance"],["templates","Templates"],["automation","Automation"]];
   navItems.forEach(function(pair) {
     var id = pair[0], label = pair[1];
     var pending = getPending();
@@ -471,6 +484,10 @@ function renderSidebar() {
     b.className = "nav-btn";
     if (id === "tasks" && pending.length > 0) {
       b.appendChild(div({marginLeft:"auto",background:"#f5a62322",color:"#f5a623",fontSize:"9px",fontWeight:"700",padding:"1px 5px",borderRadius:"100px"}, pending.length));
+    }
+    if (id === "automation") {
+      var dot = div({marginLeft:"auto",width:"6px",height:"6px",borderRadius:"50%",background: G.n8n.enabled ? "#34d399" : "#333",flexShrink:"0"});
+      b.appendChild(dot);
     }
     nav.appendChild(b);
   });
@@ -505,7 +522,7 @@ function renderMain() {
   var mn = document.getElementById("main");
   mn.innerHTML = "";
   var st = getStats();
-  var titles = {signal:"Signal Feed",pipeline:"Pipeline",forecast:"Forecast",contacts:"Contacts",tasks:"Tasks",callqueue:"Call Queue",cal:"Calendar",stats:"Performance",templates:"Templates"};
+  var titles = {signal:"Signal Feed",pipeline:"Pipeline",forecast:"Forecast",contacts:"Contacts",tasks:"Tasks",callqueue:"Call Queue",cal:"Calendar",stats:"Performance",templates:"Templates",automation:"Automation"};
 
   var tb = div({display:"flex",alignItems:"center",justifyContent:"space-between",padding:"11px 20px 9px",borderBottom:"1px solid #1a1a24",flexShrink:"0",gap:"8px"});
   var tl = div({});
@@ -520,7 +537,7 @@ function renderMain() {
 
   var content = div({flex:"1",overflowY:"auto",padding:"13px 20px 18px"});
   content.className = "anim";
-  var viewFns = {signal:renderSignal,pipeline:renderKanban,forecast:renderForecast,contacts:renderContacts,tasks:renderTasks,callqueue:renderCallQueue,cal:renderCal,stats:renderStats,templates:renderTemplates};
+  var viewFns = {signal:renderSignal,pipeline:renderKanban,forecast:renderForecast,contacts:renderContacts,tasks:renderTasks,callqueue:renderCallQueue,cal:renderCal,stats:renderStats,templates:renderTemplates,automation:renderAutomation};
   if (viewFns[G.view]) content.appendChild(viewFns[G.view]());
   mn.appendChild(content);
 }
@@ -1447,6 +1464,8 @@ function renderModal() {
       newC.score = autoScore(newC);
       G.contacts.push(newC);
       persist(); G.modal = null; render();
+      // N8N: trigger lead enrichment for new contact
+      if (G.n8n.enabled) n8nTriggerNewContact(newC);
     }));
   } else if (G.modal === "logEmail" && c) {
     var fd = {subject:"",preview:"",date:today(),direction:"out"};
@@ -1465,8 +1484,14 @@ function renderModal() {
     pn.appendChild(mSelect("Sentiment","sentiment",["positive","neutral","negative"],fd)); pn.appendChild(gap());
     pn.appendChild(accentBtn("Log Call", function() {
       if (!fd.notes && !fd.duration) return;
-      updateContact(c.id, {calls:(c.calls||[]).concat([Object.assign({id:"l_"+Date.now()},fd)]),lastContact:fd.date||today()});
+      var activity = Object.assign({id:"l_"+Date.now(), type:"call"}, fd);
+      updateContact(c.id, {calls:(c.calls||[]).concat([activity]),lastContact:fd.date||today()});
       G.modal = null; md.innerHTML = "";
+      // N8N: trigger follow-up generator after call
+      if (G.n8n.enabled) {
+        var updated = G.contacts.find(function(x){ return x.id === c.id; });
+        if (updated) n8nTriggerActivityLogged(updated, activity);
+      }
     }));
   } else if (G.modal === "addTask" && c) {
     var fd = {text:"",due:today(),priority:"medium"};
@@ -1485,8 +1510,14 @@ function renderModal() {
     pn.appendChild(mSelect("Platform","platform",["Zoom","Google Meet","Teams","Phone","In Person"],fd)); pn.appendChild(gap());
     pn.appendChild(accentBtn("Add Meeting", function() {
       if (!fd.title) return;
-      updateContact(c.id, {meetings:(c.meetings||[]).concat([Object.assign({id:"m_"+Date.now()},fd)])});
+      var activity = Object.assign({id:"m_"+Date.now(), type:"meeting"}, fd);
+      updateContact(c.id, {meetings:(c.meetings||[]).concat([activity])});
       G.modal = null; md.innerHTML = "";
+      // N8N: trigger follow-up generator after meeting
+      if (G.n8n.enabled) {
+        var updated = G.contacts.find(function(x){ return x.id === c.id; });
+        if (updated) n8nTriggerActivityLogged(updated, activity);
+      }
     }));
   } else if (G.modal === "quota") {
     var fd = Object.assign({},G.quota);
@@ -1552,6 +1583,9 @@ function renderModal() {
       G.icpConfig = {industries:fd.industries?fd.industries.split(",").map(function(s){return s.trim();}):[], titles:fd.titles?fd.titles.split(",").map(function(s){return s.trim();}):[], minDeal:parseInt(fd.minDeal)||5000, maxDeal:parseInt(fd.maxDeal)||50000};
       persist(); G.modal=null; render();
     }));
+
+  } else if (G.modal === "n8nConfig") {
+    pn.appendChild(renderN8NConfigModal());
 
   } else if (G.modal === "addTemplate") {
     var EMAIL_TYPES = ["first-touch","follow-up","reply-to","breakup","post-meeting","proposal","other"];
@@ -2240,6 +2274,245 @@ function renderCompetitorsTab(c) {
     w.appendChild(patternsBox);
   }
   return w;
+}
+
+// ================================================================
+// N8N AUTOMATION INTEGRATION
+// ================================================================
+
+function n8nRequest(path, payload) {
+  if (!G.n8n.enabled) return Promise.resolve(null);
+  return fetch(G.n8n.serviceUrl + path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-webhook-secret": G.n8n.webhookSecret
+    },
+    body: JSON.stringify(payload)
+  }).then(function(r) { return r.json(); }).catch(function(err) {
+    console.warn("[N8N]", path, "failed:", err.message);
+    return null;
+  });
+}
+
+function n8nGet(path) {
+  if (!G.n8n.enabled) return Promise.resolve(null);
+  return fetch(G.n8n.serviceUrl + path).then(function(r) { return r.json(); }).catch(function() { return null; });
+}
+
+function n8nTriggerNewContact(contact) {
+  n8nRequest("/api/automation/new-contact", contact).then(function(res) {
+    if (res && res.logId) {
+      G.n8n.logs.unshift({id: res.logId, event: "new-contact", contact: contact.name, time: new Date().toLocaleTimeString(), status: "queued"});
+      if (G.view === "automation") render();
+    }
+  });
+}
+
+function n8nTriggerStageChange(contact, previousStage) {
+  n8nRequest("/api/automation/stage-change", {contact: contact, previousStage: previousStage, newStage: contact.stage}).then(function(res) {
+    if (res) {
+      G.n8n.logs.unshift({id: Date.now().toString(), event: "stage-change", contact: contact.name, detail: previousStage + " → " + contact.stage, time: new Date().toLocaleTimeString(), status: res.action || "triggered"});
+      if (G.view === "automation") render();
+    }
+  });
+  // Also sync the updated contact to the service
+  n8nRequest("/api/contacts", contact);
+}
+
+function n8nTriggerActivityLogged(contact, activity) {
+  if (!["call", "meeting"].includes(activity.type)) return;
+  n8nRequest("/api/automation/activity-logged", {contact: contact, activity: activity}).then(function(res) {
+    if (res && res.logId) {
+      G.n8n.logs.unshift({id: res.logId, event: "activity-logged", contact: contact.name, detail: activity.type, time: new Date().toLocaleTimeString(), status: "queued"});
+      if (G.view === "automation") render();
+    }
+  });
+}
+
+function n8nSyncAll() {
+  if (!G.n8n.enabled) return;
+  n8nRequest("/api/sync/contacts", {contacts: G.contacts}).then(function(res) {
+    if (res) console.log("[N8N] Synced", res.synced, "contacts");
+  });
+}
+
+function n8nCheckHealth() {
+  return fetch(G.n8n.serviceUrl + "/api/health").then(function(r) { return r.json(); }).catch(function() { return null; });
+}
+
+// ── Automation Dashboard View ─────────────────────────────────────────────────
+function renderAutomation() {
+  var w = div({display:"flex",flexDirection:"column",gap:"12px"});
+
+  // Header status card
+  var statusCard = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"14px 16px"});
+  var statusRow = div({display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"12px"});
+  statusRow.appendChild(div({fontSize:"13px",fontWeight:"700",color:"#e8e8f0"}, "N8N Bridge Service"));
+  var badge = div({fontSize:"10px",fontWeight:"700",padding:"3px 9px",borderRadius:"100px",
+    background: G.n8n.enabled ? "rgba(52,211,153,0.15)" : "rgba(248,113,113,0.12)",
+    color: G.n8n.enabled ? "#34d399" : "#f87171"
+  }, G.n8n.enabled ? "CONNECTED" : "DISABLED");
+  statusRow.appendChild(badge);
+  statusCard.appendChild(statusRow);
+
+  // Config row
+  var cfgGrid = div({display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"12px"});
+  var urlBox = div({background:"#13131a",borderRadius:"7px",padding:"8px 10px"});
+  urlBox.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:"3px"}, "Service URL"));
+  urlBox.appendChild(div({fontSize:"11px",color:"#4a9eff",fontFamily:"monospace"}, G.n8n.serviceUrl));
+  cfgGrid.appendChild(urlBox);
+  var statsBox = div({background:"#13131a",borderRadius:"7px",padding:"8px 10px"});
+  statsBox.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:"3px"}, "Events Today"));
+  statsBox.appendChild(div({fontSize:"11px",color:"#a78bfa",fontWeight:"700"}, G.n8n.logs.length));
+  cfgGrid.appendChild(statsBox);
+  statusCard.appendChild(cfgGrid);
+
+  // Action buttons
+  var btnRow = div({display:"flex",gap:"7px",flexWrap:"wrap"});
+
+  var toggleBtn = mkBtn(G.n8n.enabled ? "Disable Automation" : "Enable Automation", function() {
+    G.n8n.enabled = !G.n8n.enabled;
+    if (G.n8n.enabled) n8nSyncAll();
+    render();
+  }, {padding:"6px 12px",borderRadius:"7px",fontSize:"11px",fontWeight:"700",border:"none",
+    background: G.n8n.enabled ? "rgba(248,113,113,0.15)" : "linear-gradient(135deg,#4a9eff,#a78bfa)",
+    color: G.n8n.enabled ? "#f87171" : "#fff"});
+  btnRow.appendChild(toggleBtn);
+
+  btnRow.appendChild(mkBtn("Test Connection", function() {
+    var btn = this; btn.textContent = "Checking..."; btn.disabled = true;
+    n8nCheckHealth().then(function(res) {
+      btn.textContent = res && res.status === "ok" ? "Connected!" : "Unreachable";
+      btn.style.color = res && res.status === "ok" ? "#34d399" : "#f87171";
+      setTimeout(function() { btn.textContent = "Test Connection"; btn.disabled = false; btn.style.color = "#aaa"; }, 2500);
+    });
+  }, {padding:"6px 12px",borderRadius:"7px",fontSize:"11px",fontWeight:"600",border:"1px solid #1e1e2a",background:"#13131a",color:"#aaa"}));
+
+  btnRow.appendChild(mkBtn("Sync All Contacts", function() {
+    if (!G.n8n.enabled) { alert("Enable automation first."); return; }
+    n8nSyncAll();
+    this.textContent = "Synced!"; this.style.color = "#34d399";
+    var self = this; setTimeout(function() { self.textContent = "Sync All Contacts"; self.style.color = "#aaa"; }, 2000);
+  }, {padding:"6px 12px",borderRadius:"7px",fontSize:"11px",fontWeight:"600",border:"1px solid #1e1e2a",background:"#13131a",color:"#aaa"}));
+
+  btnRow.appendChild(mkBtn("Configure", function() { G.modal = "n8nConfig"; renderModal(); }, {padding:"6px 12px",borderRadius:"7px",fontSize:"11px",fontWeight:"600",border:"1px solid #1e1e2a",background:"#13131a",color:"#aaa"}));
+  statusCard.appendChild(btnRow);
+  w.appendChild(statusCard);
+
+  // Workflows overview
+  var workflowCard = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"14px 16px"});
+  workflowCard.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#888",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:"10px"}, "Active Workflows"));
+  var workflows = [
+    {name:"Lead Enrichment", trigger:"New contact added", icon:"🧠", color:"#a78bfa"},
+    {name:"Email Sequences", trigger:"Stage → Nurture", icon:"📧", color:"#4a9eff"},
+    {name:"Deal Health Monitor", trigger:"Daily 8AM (Mon–Fri)", icon:"📊", color:"#34d399"},
+    {name:"AI Follow-up Generator", trigger:"Call or meeting logged", icon:"🤖", color:"#f5a623"}
+  ];
+  workflows.forEach(function(wf) {
+    var row = div({display:"flex",alignItems:"center",gap:"10px",padding:"8px 10px",background:"#13131a",borderRadius:"7px",marginBottom:"6px"});
+    row.appendChild(div({fontSize:"16px"}, wf.icon));
+    var info = div({flex:"1"});
+    info.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#e8e8f0"}, wf.name));
+    info.appendChild(div({fontSize:"9px",color:"#666",marginTop:"2px"}, "Trigger: " + wf.trigger));
+    row.appendChild(info);
+    var dot = div({width:"6px",height:"6px",borderRadius:"50%",background: G.n8n.enabled ? wf.color : "#333",flexShrink:"0"});
+    row.appendChild(dot);
+    workflowCard.appendChild(row);
+  });
+  w.appendChild(workflowCard);
+
+  // Event log
+  var logCard = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"14px 16px"});
+  var logHead = div({display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"10px"});
+  logHead.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#888",textTransform:"uppercase",letterSpacing:"0.08em"}, "Event Log"));
+  if (G.n8n.logs.length > 0) {
+    logHead.appendChild(mkBtn("Clear", function() { G.n8n.logs = []; render(); }, {fontSize:"9px",color:"#f87171",background:"none",border:"none"}));
+  }
+  logCard.appendChild(logHead);
+
+  if (G.n8n.logs.length === 0) {
+    logCard.appendChild(div({fontSize:"11px",color:"#444",textAlign:"center",padding:"20px 0"}, G.n8n.enabled ? "No events yet. Trigger one by adding a contact or logging a call." : "Enable automation to start tracking events."));
+  } else {
+    G.n8n.logs.slice(0, 30).forEach(function(log) {
+      var row = div({display:"flex",alignItems:"center",gap:"8px",padding:"7px 10px",background:"#13131a",borderRadius:"6px",marginBottom:"5px"});
+      var eventColors = {"new-contact":"#4a9eff","stage-change":"#a78bfa","activity-logged":"#34d399"};
+      var dot2 = div({width:"5px",height:"5px",borderRadius:"50%",background:eventColors[log.event]||"#888",flexShrink:"0"});
+      row.appendChild(dot2);
+      var info2 = div({flex:"1"});
+      info2.appendChild(div({fontSize:"10px",color:"#ccc"}, log.contact + (log.detail ? " · " + log.detail : "")));
+      info2.appendChild(div({fontSize:"9px",color:"#555"}, log.event + " · " + log.time));
+      row.appendChild(info2);
+      var statusColors = {queued:"#f5a623",triggered:"#4a9eff","stage-change→Nurture":"#a78bfa",completed:"#34d399",failed:"#f87171"};
+      var stLabel = div({fontSize:"9px",padding:"2px 6px",borderRadius:"100px",
+        background:"rgba(255,255,255,0.05)",color:statusColors[log.status]||"#888"}, log.status);
+      row.appendChild(stLabel);
+      logCard.appendChild(row);
+    });
+  }
+  w.appendChild(logCard);
+
+  // Enrichments section
+  if (G.n8n.enabled && G.selId) {
+    var selContact = getSelected();
+    if (selContact) {
+      var enrichCard = div({background:"#0e0f14",border:"1px solid #1a1a24",borderRadius:"10px",padding:"14px 16px"});
+      enrichCard.appendChild(div({fontSize:"11px",fontWeight:"700",color:"#888",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:"10px"}, "AI Enrichment · " + selContact.name));
+      var fetchBtn = mkBtn("Fetch Enrichment", function() {
+        var btn = this; btn.textContent = "Loading..."; btn.disabled = true;
+        n8nGet("/api/enrichments/" + selContact.id).then(function(data) {
+          btn.textContent = "Fetch Enrichment"; btn.disabled = false;
+          if (!data || data.error) { enrichCard.appendChild(div({fontSize:"11px",color:"#f87171",marginTop:"8px"}, "No enrichment found. Add or sync this contact first.")); return; }
+          var result = data.result;
+          if (result.talkingPoints) {
+            var tp = div({marginTop:"8px"});
+            tp.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",marginBottom:"4px"}, "Talking Points"));
+            result.talkingPoints.forEach(function(pt) {
+              tp.appendChild(div({fontSize:"10px",color:"#aaa",marginBottom:"3px",paddingLeft:"8px",borderLeft:"2px solid #4a9eff"}, pt));
+            });
+            enrichCard.appendChild(tp);
+          }
+          if (result.recommendedFirstMessage) {
+            var rfm = div({marginTop:"8px",padding:"8px 10px",background:"#13131a",borderRadius:"7px",borderLeft:"2px solid #a78bfa"});
+            rfm.appendChild(div({fontSize:"9px",color:"#555",textTransform:"uppercase",marginBottom:"3px"}, "Recommended First Message"));
+            rfm.appendChild(div({fontSize:"10px",color:"#ccc",fontStyle:"italic"}, result.recommendedFirstMessage));
+            enrichCard.appendChild(rfm);
+          }
+        });
+      }, {padding:"6px 12px",borderRadius:"7px",fontSize:"11px",fontWeight:"600",border:"1px solid #1e1e2a",background:"#13131a",color:"#4a9eff"});
+      enrichCard.appendChild(fetchBtn);
+      w.appendChild(enrichCard);
+    }
+  }
+
+  return w;
+}
+
+// ── N8N Config Modal ──────────────────────────────────────────────────────────
+function renderN8NConfigModal() {
+  var body = div({display:"flex",flexDirection:"column",gap:"12px",padding:"20px"});
+  body.appendChild(div({fontSize:"14px",fontWeight:"700",marginBottom:"4px"}, "N8N Automation Configuration"));
+
+  var urlLabel = mkLabel("Bridge Service URL");
+  var urlIn = mkInput(G.n8n.serviceUrl, function(v) { G.n8n.serviceUrl = v; });
+  urlLabel.appendChild(urlIn);
+  body.appendChild(urlLabel);
+
+  var secretLabel = mkLabel("Webhook Secret");
+  var secretIn = mkInput(G.n8n.webhookSecret, function(v) { G.n8n.webhookSecret = v; }, {}, "password");
+  secretLabel.appendChild(secretIn);
+  body.appendChild(secretLabel);
+
+  body.appendChild(div({fontSize:"10px",color:"#666",lineHeight:"1.5"},
+    "The bridge service runs at localhost:3001 by default. Start it with `cd n8n-service && npm start`. The webhook secret must match the WEBHOOK_SECRET env variable in .env."));
+
+  var saveBtn = mkBtn("Save Configuration", function() {
+    G.modal = null;
+    renderModal();
+    if (G.view === "automation") render();
+  }, {padding:"8px 16px",borderRadius:"7px",background:"linear-gradient(135deg,#4a9eff,#a78bfa)",border:"none",color:"#fff",fontSize:"12px",fontWeight:"700",width:"100%"});
+  body.appendChild(saveBtn);
+  return body;
 }
 
 function render() {
